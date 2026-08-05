@@ -39,8 +39,11 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TARGET_DATE = os.getenv("TARGET_DATE", "").strip()
 ONLY_AFTER_5PM = os.getenv("ONLY_AFTER_5PM", "1") == "1"
-ALERT_REPEAT = int(os.getenv("ALERT_REPEAT", "3"))
+ALERT_REPEAT = int(os.getenv("ALERT_REPEAT", "5"))
 ALERT_INTERVAL = int(os.getenv("ALERT_INTERVAL", "3"))
+HEARTBEAT = os.getenv("HEARTBEAT", "1") == "1"          # hourly "still alive" ping
+TZ_OFFSET = int(os.getenv("TZ_OFFSET", "3"))            # Cairo = UTC+3 (summer)
+
 
 # Each experience is a <div class="ex_<key>_content"> block on the page.
 EXPERIENCES = [
@@ -141,6 +144,38 @@ def notify(text: str, keyboard) -> None:
             time.sleep(ALERT_INTERVAL)
 
 
+def send_plain(text: str) -> None:
+    """One-off Telegram message, no buttons, no burst (for the heartbeat)."""
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
+        return
+    requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+        json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
+              "disable_notification": True},   # quiet: it's just a status ping
+        timeout=20,
+    )
+
+
+def local_now():
+    return datetime.utcnow() + timedelta(hours=TZ_OFFSET)
+
+
+def maybe_heartbeat(is_open: bool, target: str) -> bool:
+    """Send an hourly status ping. Returns True if it sent one this run."""
+    if not HEARTBEAT:
+        return False
+    now = local_now()
+    # only the run that lands in the first 5 min of the hour sends it
+    if now.minute >= 5:
+        return False
+    stamp = now.strftime("%H:%M")
+    if is_open:
+        send_plain(f"\u2705 {stamp} - checked: {target} is OPEN (see the alert above)")
+    else:
+        send_plain(f"\U0001F50D {stamp} - checked: {target} not open yet, still watching")
+    return True
+
+
 # ------------------------- Vercel serverless endpoint -------------------------
 import json
 import traceback
@@ -151,7 +186,8 @@ def run_check() -> dict:
     target = target_day()
     days = open_days(fetch(MOVIE_URL))
     if target not in days:
-        return {"open": False, "target": target, "open_days": sorted(days)}
+        beat = maybe_heartbeat(False, target)
+        return {"open": False, "target": target, "open_days": sorted(days), "heartbeat": beat}
 
     by_exp = parse_showtimes(fetch(f"{MOVIE_URL}?business_day={target}&ajax=1"))
     if not by_exp:
@@ -159,8 +195,10 @@ def run_check() -> dict:
 
     text, keyboard = build_message(target, by_exp)
     notify(text, keyboard)
+    beat = maybe_heartbeat(True, target)
     return {"open": True, "target": target,
-            "showtimes": {k: [t for t, _ in v] for k, v in by_exp.items()}}
+            "showtimes": {k: [t for t, _ in v] for k, v in by_exp.items()},
+            "heartbeat": beat}
 
 
 class handler(BaseHTTPRequestHandler):
