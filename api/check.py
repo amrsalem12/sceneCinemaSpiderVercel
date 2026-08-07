@@ -176,6 +176,37 @@ def maybe_heartbeat(is_open: bool, target: str) -> bool:
     return True
 
 
+# ------------------------- diagnostic URL probe (temporary) -------------------
+import time as _time
+from urllib.parse import urlparse as _urlparse, parse_qs as _parse_qs
+
+_VOX_TEST_URL = "https://egy.voxcinemas.com/ar/movies/spider-man-brand-new-day?d=20260808"
+
+_PROBE_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def probe(url: str) -> dict:
+    t0 = _time.time()
+    r = requests.get(url, headers=_PROBE_HEADERS, timeout=25, allow_redirects=True)
+    body = r.text
+    return {
+        "requested_url": url,
+        "final_url": r.url,
+        "status_code": r.status_code,
+        "elapsed_sec": round(_time.time() - t0, 2),
+        "length": len(body),
+        "looks_blocked": any(s in body.lower() for s in
+                             ["access denied", "captcha", "cloudflare", "are you a robot"]),
+        "no_showtimes_marker": "no showtimes could be found" in body.lower(),
+        "snippet": body[:600],
+    }
+
+
 # ------------------------- Vercel serverless endpoint -------------------------
 import json
 import traceback
@@ -203,8 +234,16 @@ def run_check() -> dict:
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        qs = _parse_qs(_urlparse(self.path).query)
+        test_url = (qs.get("url") or [""])[0]
+        want_vox = (qs.get("vox") or [""])[0]
         try:
-            body = run_check()
+            if want_vox:                       # ?vox=1 -> probe the hardcoded VOX url
+                body = probe(_VOX_TEST_URL)
+            elif test_url:                     # ?url=<encoded target> -> probe that
+                body = probe(test_url)
+            else:
+                body = run_check()
             code = 200
         except Exception:
             body = {"error": traceback.format_exc()}
