@@ -7,4 +7,4 @@ dependencies = [
 ]
 
 [tool.vercel]
-entrypoint = "api.testfetch:handler"
+entrypoint = "api.check:handler"
