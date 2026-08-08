@@ -176,6 +176,57 @@ def maybe_heartbeat(is_open: bool, target: str) -> bool:
     return True
 
 
+# ------------------------- VOX read-endpoint probe (temporary) ----------------
+import gzip as _gzip, json as _json2
+from urllib.request import Request as _Req, urlopen as _urlopen
+
+_VOX_APP_HEADERS = {
+    "Application-Name": "VOX Android Application",
+    "Application-Version": "2.22.3",
+    "Device-Identifier": "00000000-5e1f-f519-ffff-ffffef05ac4a",
+    "User-Agent": "okhttp/4.10.0",
+    "Accept-Encoding": "gzip",
+}
+_VOX_BULK = ("https://egy.voxcinemas.com/ar/api/bulk/location"
+             "?region=EG&language=ar&version=2")
+
+
+def probe_vox() -> dict:
+    out = {"step1_bulk_location": {}, "step2_cdn_bundle": {}}
+    # Step 1: bulk/location -> returns the current CDN bundle URL (plain text)
+    try:
+        r = requests.get(_VOX_BULK, headers=_VOX_APP_HEADERS, timeout=25)
+        bundle_url = r.text.strip()
+        out["step1_bulk_location"] = {
+            "status_code": r.status_code,
+            "bundle_url": bundle_url[:200],
+        }
+    except Exception as e:
+        out["step1_bulk_location"] = {"error": repr(e)}
+        return out
+    # Step 2: fetch + gunzip the CDN bundle, report top-level keys + counts
+    try:
+        rr = requests.get(bundle_url, headers={"User-Agent": "okhttp/4.10.0"},
+                          timeout=25)
+        raw = rr.content
+        try:
+            text = _gzip.decompress(raw).decode("utf-8", "replace")
+        except OSError:
+            text = raw.decode("utf-8", "replace")   # already decompressed
+        data = _json2.loads(text)
+        out["step2_cdn_bundle"] = {
+            "status_code": rr.status_code,
+            "bytes": len(raw),
+            "top_level_keys": list(data.keys())[:30],
+            "movies": len(data.get("movies", [])),
+            "sessions": len(data.get("sessions", [])),
+            "cinemas": len(data.get("cinemas", [])),
+        }
+    except Exception as e:
+        out["step2_cdn_bundle"] = {"error": repr(e), "raw_head": raw[:120].hex()}
+    return out
+
+
 # ------------------------- diagnostic URL probe (temporary) -------------------
 import time as _time
 from urllib.parse import urlparse as _urlparse, parse_qs as _parse_qs
@@ -238,7 +289,9 @@ class handler(BaseHTTPRequestHandler):
         test_url = (qs.get("url") or [""])[0]
         want_vox = (qs.get("vox") or [""])[0]
         try:
-            if want_vox:                       # ?vox=1 -> probe the hardcoded VOX url
+            if (qs.get("vox_api") or [""])[0]: # ?vox_api=1 -> test VOX read endpoints
+                body = probe_vox()
+            elif want_vox:                     # ?vox=1 -> probe the hardcoded VOX url
                 body = probe(_VOX_TEST_URL)
             elif test_url:                     # ?url=<encoded target> -> probe that
                 body = probe(test_url)
