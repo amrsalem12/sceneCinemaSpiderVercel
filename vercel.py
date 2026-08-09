@@ -1,6 +1,6 @@
 {
-  "functions": {
-    "api/webhook.py": { "runtime": "python@3.12" },
-    "api/check.py": { "runtime": "python@3.12" }
-  }
+  "rewrites": [
+    { "source": "/api/webhook", "destination": "/api/index" },
+    { "source": "/api/check", "destination": "/api/index" }
+  ]
 }
