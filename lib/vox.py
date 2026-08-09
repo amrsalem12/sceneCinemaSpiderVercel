@@ -26,9 +26,7 @@ APP_HEADERS = {
 
 # Egypt cinemas we care about (id -> friendly name)
 EG_CINEMAS = {
-    "000028": "Mall of Egypt",
-    "000047": "City Centre Almaza",
-    "000032": "City Centre Alexandria",
+    "000047": "City Centre Almaza",   # the only VOX cinema Amr cares about
 }
 EXPERIENCE = {"gd": "Gold", "imx": "IMAX", "mx": "MAX", "fx": "4DX",
               "kd": "Kids", "st": "Standard"}
