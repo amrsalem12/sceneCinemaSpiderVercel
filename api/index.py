@@ -1,6 +1,6 @@
 """
 Single Vercel entrypoint (the newer Python runtime wants ONE entrypoint).
-Routes by path AND falls back to method/payload so it works even if the
+Routes by path AND falls back to method/payload so it works even if the  
 platform rewrites the visible path:
 
   - POST carrying a Telegram update   -> webhook logic
