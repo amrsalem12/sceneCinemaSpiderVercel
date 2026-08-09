@@ -40,15 +40,18 @@ def _get(url, headers=None, timeout=25):
         return r.read()
 
 
+def _decode_maybe_gzip(raw: bytes) -> str:
+    """Decode bytes that may or may not be gzip-compressed."""
+    if raw[:2] == b"\x1f\x8b":              # gzip magic number
+        return gzip.decompress(raw).decode("utf-8", "replace")
+    return raw.decode("utf-8", "replace")
+
+
 def fetch_bundle():
     """Return the parsed Egypt dataset dict (fresh each call)."""
-    bundle_url = _get(BULK_URL, APP_HEADERS).decode().strip()
+    bundle_url = _decode_maybe_gzip(_get(BULK_URL, APP_HEADERS)).strip()
     raw = _get(bundle_url, {"User-Agent": "okhttp/4.10.0"})
-    try:
-        text = gzip.decompress(raw).decode("utf-8")
-    except OSError:
-        text = raw.decode("utf-8")           # already decompressed
-    return json.loads(text)
+    return json.loads(_decode_maybe_gzip(raw))
 
 
 # ---------- movie helpers ----------
