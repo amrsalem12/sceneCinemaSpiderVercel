@@ -1,9 +1,11 @@
 """
-Single Vercel entrypoint. The newer Python runtime wants ONE entrypoint, so we
-route internally by path:
-  /api/webhook  (POST from Telegram)  -> webhook logic
-  /api/check    (GET from cron-job.org) -> cron sweep
-  anything else -> health check
+Single Vercel entrypoint (the newer Python runtime wants ONE entrypoint).
+Routes by path AND falls back to method/payload so it works even if the
+platform rewrites the visible path:
+
+  - POST carrying a Telegram update   -> webhook logic
+  - path contains 'check' (GET/POST)  -> cron sweep
+  - anything else                     -> health check
 """
 import os
 import sys
@@ -16,28 +18,42 @@ from lib import logic_webhook, logic_check
 
 
 class handler(BaseHTTPRequestHandler):
-    def _route(self):
-        path = self.path.split("?")[0].rstrip("/")
+    def _route(self, method):
+        path = self.path.split("?")[0].rstrip("/").lower()
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b""
 
-        if path.endswith("/check"):
-            body = logic_check.run_sweep()
-            return 200, body
-        if path.endswith("/webhook"):
+        # explicit cron path
+        if "check" in path:
+            return 200, logic_check.run_sweep()
+
+        # webhook: explicit path OR any POST that looks like a Telegram update
+        looks_like_telegram = False
+        update = None
+        if raw:
             try:
                 update = json.loads(raw.decode() or "{}")
-                logic_webhook.handle_update(update)
+                looks_like_telegram = isinstance(update, dict) and (
+                    "message" in update or "callback_query" in update
+                    or "edited_message" in update or "update_id" in update)
             except Exception:
-                pass
+                update = None
+
+        if "webhook" in path or (method == "POST" and looks_like_telegram):
+            if update is not None:
+                try:
+                    logic_webhook.handle_update(update)
+                except Exception:
+                    pass
             return 200, {"ok": True}
-        return 200, {"status": "cinema bot up", "path": path}
+
+        return 200, {"status": "cinema bot up", "path": path or "/"}
 
     def do_GET(self):
-        self._send(*self._route())
+        self._send(*self._route("GET"))
 
     def do_POST(self):
-        self._send(*self._route())
+        self._send(*self._route("POST"))
 
     def _send(self, code, body):
         payload = json.dumps(body).encode()
