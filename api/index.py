@@ -1,6 +1,6 @@
 """
 Single Vercel entrypoint (the newer Python runtime wants ONE entrypoint).
-Routes by path AND falls back to method/payload so it works even if the  
+Routes by path AND falls back to method/payload so it works even if the
 platform rewrites the visible path:
 
   - POST carrying a Telegram update   -> webhook logic
@@ -22,6 +22,23 @@ class handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0].rstrip("/").lower()
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b""
+
+        # TEMP debug route: /api/debug -> exercise KV + report any error
+        if "debug" in path:
+            import traceback
+            out = {}
+            try:
+                from lib import store
+                out["kv_available"] = store._kv_available()
+                out["kv_ping"] = store._kv("SET", "diag", "ok") if store._kv_available() else "no-kv"
+                out["kv_read"] = store._kv("GET", "diag") if store._kv_available() else "no-kv"
+                out["allowlist"] = store._get("allowlist", [])
+                import os
+                out["has_telegram_token"] = bool(os.getenv("TELEGRAM_TOKEN"))
+                out["join_code_set"] = bool(os.getenv("JOIN_CODE"))
+            except Exception:
+                out["error"] = traceback.format_exc()
+            return 200, out
 
         # explicit cron path
         if "check" in path:
