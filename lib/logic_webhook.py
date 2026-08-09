@@ -1,7 +1,7 @@
 """
 Telegram webhook — the interactive surface of the bot.
 
-Receives commands + button taps from Telegram and drives both modes:
+Receives commands + button taps from Telegram and drives both modes: 
   MODE A  /showing   -> browse now-showing (both chains) -> showtimes -> deep-link book
   MODE B  /upcoming  -> browse coming-soon -> mark flow (cinema, time filter) -> watch
   Manage  /list, /remove <n>, /booked <n>
