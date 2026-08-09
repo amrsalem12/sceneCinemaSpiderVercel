@@ -35,7 +35,13 @@ class handler(BaseHTTPRequestHandler):
                 out["allowlist"] = store._get("allowlist", [])
                 import os
                 out["has_telegram_token"] = bool(os.getenv("TELEGRAM_TOKEN"))
-                out["join_code_set"] = bool(os.getenv("JOIN_CODE"))
+                jc = os.getenv("JOIN_CODE")
+                out["join_code_is_none"] = jc is None
+                out["join_code_len"] = (len(jc) if jc is not None else -1)
+                out["join_code_repr"] = repr(jc)[:40]
+                # list env keys that look related, to catch a name typo
+                out["env_keys_with_join_or_code"] = [k for k in os.environ
+                                                     if "JOIN" in k.upper() or "CODE" in k.upper()]
             except Exception:
                 out["error"] = traceback.format_exc()
             return 200, out
