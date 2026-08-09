@@ -2,6 +2,7 @@
 name = "cinema-bot"
 version = "1.0.0"
 requires-python = ">=3.12"
-dependencies = [
-    "requests",
-]
+dependencies = []
+
+[tool.vercel]
+entrypoint = "api.index:handler"
