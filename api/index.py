@@ -1,94 +1,157 @@
 """
-Single Vercel entrypoint (the newer Python runtime wants ONE entrypoint).
-Routes by path AND falls back to method/payload so it works even if the
-platform rewrites the visible path:
+VOX Cinemas Egypt — data access (READ-ONLY, cloud-reachable).
 
-  - POST carrying a Telegram update   -> webhook logic
-  - path contains 'check' (GET/POST)  -> cron sweep
-  - anything else                     -> health check
+Flow (all confirmed working from Vercel):
+  1. GET bulk/location (app headers) -> current CDN bundle URL
+  2. GET that .json.gz from assets.voxcinemas.com -> gunzip -> full Egypt dataset
+  3. filter movies (now-showing / coming-soon) and sessions (by movie/cinema/date/time)
+
+No auth key needed; gated only by app headers. Booking = deep link (bookingUrl);
+we never start a VOX booking session.
 """
-import os
-import sys
+import gzip
 import json
-from http.server import BaseHTTPRequestHandler
+import urllib.request
+from datetime import datetime
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+BULK_URL = ("https://egy.voxcinemas.com/ar/api/bulk/location"
+            "?region=EG&language=ar&version=2")
+APP_HEADERS = {
+    "Application-Name": "VOX Android Application",
+    "Application-Version": "2.22.3",
+    "Device-Identifier": "00000000-5e1f-f519-ffff-ffffef05ac4a",
+    "User-Agent": "okhttp/4.10.0",
+    "Accept-Encoding": "gzip",
+}
 
-from lib import logic_webhook, logic_check
+# Egypt cinemas we care about (id -> friendly name)
+EG_CINEMAS = {
+    "000047": "City Centre Almaza",   # the only VOX cinema Amr cares about
+}
+EXPERIENCE = {"gd": "Gold", "imx": "IMAX", "mx": "MAX", "fx": "4DX",
+              "kd": "Kids", "st": "Standard"}
 
 
-class handler(BaseHTTPRequestHandler):
-    def _route(self, method):
-        path = self.path.split("?")[0].rstrip("/").lower()
-        length = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(length) if length else b""
+def _get(url, headers=None, timeout=25):
+    req = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
 
-        # TEMP debug route: /api/debug -> exercise KV + report any error
-        if "debug" in path:
-            import traceback
-            out = {}
-            try:
-                from lib import store
-                out["kv_available"] = store._kv_available()
-                out["kv_ping"] = store._kv("SET", "diag", "ok") if store._kv_available() else "no-kv"
-                out["kv_read"] = store._kv("GET", "diag") if store._kv_available() else "no-kv"
-                out["allowlist"] = store._get("allowlist", [])
-                out["last_error"] = store._get("last_error", "(none)")
-                import os
-                out["has_telegram_token"] = bool(os.getenv("TELEGRAM_TOKEN"))
-                jc = os.getenv("JOIN_CODE")
-                out["join_code_is_none"] = jc is None
-                out["join_code_len"] = (len(jc) if jc is not None else -1)
-                out["join_code_repr"] = repr(jc)[:40]
-                # list env keys that look related, to catch a name typo
-                out["env_keys_with_join_or_code"] = [k for k in os.environ
-                                                     if "JOIN" in k.upper() or "CODE" in k.upper()]
-                # all NON-secret-looking custom env var names (helps spot wrong project)
-                sysprefixes = ("PATH","PYTHON","LANG","LC_","HOME","HOSTNAME","PWD",
-                               "SHLVL","TERM","AWS","LAMBDA","VERCEL","NOW_","_","TZ")
-                out["custom_env_names"] = sorted(
-                    k for k in os.environ
-                    if not k.startswith(sysprefixes) and "TOKEN" not in k
-                    and "SECRET" not in k and "KEY" not in k and "URL" not in k)
-            except Exception:
-                out["error"] = traceback.format_exc()
-            return 200, out
 
-        # explicit cron path
-        if "check" in path:
-            return 200, logic_check.run_sweep()
+def _decode_maybe_gzip(raw: bytes) -> str:
+    """Decode bytes that may or may not be gzip-compressed."""
+    if raw[:2] == b"\x1f\x8b":              # gzip magic number
+        return gzip.decompress(raw).decode("utf-8", "replace")
+    return raw.decode("utf-8", "replace")
 
-        # webhook: explicit path OR any POST that looks like a Telegram update
-        looks_like_telegram = False
-        update = None
-        if raw:
-            try:
-                update = json.loads(raw.decode() or "{}")
-                looks_like_telegram = isinstance(update, dict) and (
-                    "message" in update or "callback_query" in update
-                    or "edited_message" in update or "update_id" in update)
-            except Exception:
-                update = None
 
-        if "webhook" in path or (method == "POST" and looks_like_telegram):
-            if update is not None:
-                try:
-                    logic_webhook.handle_update(update)
-                except Exception:
-                    pass
-            return 200, {"ok": True}
+def fetch_bundle():
+    """Return the parsed Egypt dataset dict (fresh each call)."""
+    bundle_url = _decode_maybe_gzip(_get(BULK_URL, APP_HEADERS)).strip()
+    raw = _get(bundle_url, {"User-Agent": "okhttp/4.10.0"})
+    return json.loads(_decode_maybe_gzip(raw))
 
-        return 200, {"status": "cinema bot up", "path": path or "/"}
 
-    def do_GET(self):
-        self._send(*self._route("GET"))
+# ---------- movie helpers ----------
+def now_showing(bundle):
+    return [_movie_brief(m) for m in bundle.get("movies", []) if m.get("nowShowing")]
 
-    def do_POST(self):
-        self._send(*self._route("POST"))
 
-    def _send(self, code, body):
-        payload = json.dumps(body).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(payload)
+def coming_soon(bundle):
+    return [_movie_brief(m) for m in bundle.get("movies", []) if m.get("comingSoon")]
+
+
+def _movie_brief(m):
+    return {"id": m.get("id"), "slug": m.get("slug"), "title": m.get("title"),
+            "genre": m.get("genre"), "rating": m.get("rating"),
+            "releaseDate": m.get("releaseDate"),
+            "nowShowing": bool(m.get("nowShowing")),
+            "comingSoon": bool(m.get("comingSoon"))}
+
+
+def find_movie(bundle, slug=None, movie_id=None):
+    for m in bundle.get("movies", []):
+        if (slug and m.get("slug") == slug) or (movie_id and m.get("id") == movie_id):
+            return _movie_brief(m)
+    return None
+
+
+def is_bookable(bundle, slug):
+    """A coming-soon movie has 'opened' once it has >=1 Egypt session."""
+    m = find_movie(bundle, slug=slug)
+    if not m:
+        return False
+    return any(s.get("movieId") == m["id"] and s.get("cinemaId") in EG_CINEMAS
+               for s in bundle.get("sessions", []))
+
+
+# ---------- session (showtime) helpers ----------
+def _hour(showtime_iso):
+    try:
+        return datetime.fromisoformat(showtime_iso).hour
+    except Exception:
+        return None
+
+
+def _after5(showtime_iso):
+    h = _hour(showtime_iso)
+    return h is not None and (h >= 17 or h < 5)   # evening + late-night
+
+
+def sessions_for(bundle, *, movie_slug=None, movie_id=None,
+                 cinemas=None, display_date=None, time_filter="any",
+                 only_available=False):
+    """
+    Filter Egypt sessions. Returns list of clean dicts sorted by showtime.
+      cinemas: iterable of cinema ids, or None/"any" for all Egypt cinemas.
+      display_date: int like 20260813, or None for any date.
+      time_filter: "after5" | "any" | "first".
+      only_available: if True, drop sessions with seats==0.
+    """
+    if movie_slug and not movie_id:
+        m = find_movie(bundle, slug=movie_slug)
+        movie_id = m["id"] if m else None
+    if not movie_id:
+        return []
+
+    allowed = set(EG_CINEMAS) if (not cinemas or cinemas == "any") else set(cinemas)
+    out = []
+    for s in bundle.get("sessions", []):
+        if s.get("movieId") != movie_id:
+            continue
+        if s.get("cinemaId") not in allowed:
+            continue
+        if display_date and s.get("displayDate") != display_date:
+            continue
+        if time_filter == "after5" and not _after5(s.get("showtime", "")):
+            continue
+        if only_available and not s.get("seats"):
+            continue
+        out.append(_session_brief(s))
+
+    out.sort(key=lambda x: x["showtime"])
+    if time_filter == "first" and out:
+        out = out[:1]
+    return out
+
+
+def _session_brief(s):
+    exp_code = (s.get("experience") or "").strip(";")
+    return {
+        "id": s.get("id"),
+        "cinemaId": s.get("cinemaId"),
+        "cinema": EG_CINEMAS.get(s.get("cinemaId"), s.get("cinemaId")),
+        "experience": EXPERIENCE.get(exp_code, exp_code or "Standard"),
+        "seats": s.get("seats", 0),
+        "showtime": s.get("showtime"),
+        "time": _fmt_time(s.get("showtime")),
+        "displayDate": s.get("displayDate"),
+        "bookingUrl": s.get("bookingUrl"),
+    }
+
+
+def _fmt_time(iso):
+    try:
+        return datetime.fromisoformat(iso).strftime("%I:%M %p").lstrip("0")
+    except Exception:
+        return iso
