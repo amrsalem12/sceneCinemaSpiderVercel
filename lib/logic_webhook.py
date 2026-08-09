@@ -44,18 +44,6 @@ def add_member(user_id):
 
 # ---------------- entry point ----------------
 def handle_update(update):
-    try:
-        _handle_update_inner(update)
-    except Exception:
-        import traceback
-        try:
-            store._set("last_error", traceback.format_exc()[-1500:])
-        except Exception:
-            pass
-        raise
-
-
-def _handle_update_inner(update):
     ev = telegram.parse_update(update)
     if not ev:
         return
