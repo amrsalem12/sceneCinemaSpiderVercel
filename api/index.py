@@ -33,6 +33,7 @@ class handler(BaseHTTPRequestHandler):
                 out["kv_ping"] = store._kv("SET", "diag", "ok") if store._kv_available() else "no-kv"
                 out["kv_read"] = store._kv("GET", "diag") if store._kv_available() else "no-kv"
                 out["allowlist"] = store._get("allowlist", [])
+                out["last_error"] = store._get("last_error", "(none)")
                 import os
                 out["has_telegram_token"] = bool(os.getenv("TELEGRAM_TOKEN"))
                 jc = os.getenv("JOIN_CODE")
