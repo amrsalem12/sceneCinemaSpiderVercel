@@ -16,7 +16,7 @@ import json
 from datetime import datetime, timedelta
 
 
-from . import store, telegram, vox, scene, cronjob  # noqa: E402
+from lib import store, telegram, vox, scene, cronjob  # noqa: E402
 
 ALERT_REPEAT = int(os.getenv("ALERT_REPEAT", "5"))
 ALERT_INTERVAL = int(os.getenv("ALERT_INTERVAL", "3"))
