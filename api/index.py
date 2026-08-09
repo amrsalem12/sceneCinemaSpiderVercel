@@ -42,6 +42,13 @@ class handler(BaseHTTPRequestHandler):
                 # list env keys that look related, to catch a name typo
                 out["env_keys_with_join_or_code"] = [k for k in os.environ
                                                      if "JOIN" in k.upper() or "CODE" in k.upper()]
+                # all NON-secret-looking custom env var names (helps spot wrong project)
+                sysprefixes = ("PATH","PYTHON","LANG","LC_","HOME","HOSTNAME","PWD",
+                               "SHLVL","TERM","AWS","LAMBDA","VERCEL","NOW_","_","TZ")
+                out["custom_env_names"] = sorted(
+                    k for k in os.environ
+                    if not k.startswith(sysprefixes) and "TOKEN" not in k
+                    and "SECRET" not in k and "KEY" not in k and "URL" not in k)
             except Exception:
                 out["error"] = traceback.format_exc()
             return 200, out
