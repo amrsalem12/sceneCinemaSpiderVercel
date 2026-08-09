@@ -15,7 +15,7 @@ import sys
 import json
 
 
-from . import store, telegram, vox, scene, cronjob  # noqa: E402
+from lib import store, telegram, vox, scene, cronjob  # noqa: E402
 
 JOIN_CODE = os.getenv("JOIN_CODE", "").strip()
 
