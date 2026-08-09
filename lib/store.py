@@ -37,10 +37,10 @@ _LOCAL = "/tmp/bot_store.json"          # fallback only
 
 # ---------- low-level KV (Upstash REST) ----------
 def _kv(*command):
-    """Run one Redis command via Upstash REST. Returns the 'result' field."""
-    body = json.dumps(list(command)).encode()
+    """Run one Redis command via Upstash REST (JSON-array-to-base-url form)."""
+    body = json.dumps([str(c) for c in command]).encode()
     req = urllib.request.Request(
-        KV_URL, data=body,
+        KV_URL, data=body, method="POST",
         headers={"Authorization": f"Bearer {KV_TOKEN}",
                  "Content-Type": "application/json"},
     )
