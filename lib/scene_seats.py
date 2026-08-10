@@ -100,7 +100,7 @@ def fetch_seat_plan(showtime_id):
         # 2. POST /seat-plan (read-only — returns the layout, holds nothing)
         resp = _post(f"{BASE}/seat-plan",
                      {"showtime_id": showtime_id, "order_id": order_id,
-                      "hall_id": hall_id},
+                      "hall_id": hall_id, "_token": csrf},  # Laravel wants the token in the body
                      cookies=jar, csrf=csrf)
         return _parse_grid(json.loads(resp).get("data", []))
     except (urllib.error.URLError, urllib.error.HTTPError, socket.timeout,
@@ -121,11 +121,19 @@ def _parse_grid(cells):
         if not m:
             continue
         r, col = int(m.group(1)), int(m.group(2))
-        st = c.get("st", "")
+        # validated capture: status lives in st (or st_name) as "Free"/"Occupied"
+        st = (c.get("st") or c.get("st_name") or "").strip()
         if st == "SeatRowTitle":
             row_label[r] = (c.get("st_txt") or "").strip()
-        elif st in ("Standard", "Occupied"):
-            seatcells.append((r, col, c.get("st_txt", ""), st == "Standard"))
+        elif st in ("Free", "Occupied"):
+            seatcells.append((r, col, c.get("st_txt", ""), st == "Free"))
+        # anything else (Blank/aisle/unknown) is skipped
+
+    # if we matched grid cells but parsed no seats, the status values differ
+    # from what we expect — log the distinct values so they can be confirmed
+    if cells and not seatcells:
+        seen = sorted({(c.get("st") or c.get("st_name") or "") for c in cells})
+        print(f"[scene] parsed 0 seats from {len(cells)} cells; statuses seen: {seen}")
 
     free = taken = 0
     for r, col, label, is_free in seatcells:
