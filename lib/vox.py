@@ -7,7 +7,7 @@ Receives commands + button taps from Telegram and drives both modes:
   Manage  /list, /remove <n>, /booked <n>
   Access  send secret code once to join; /start explains.
 
-Stateless per request: conversation state (the /upcoming mark flow) lives in KV
+Stateless per request: conversation state (the /upcoming mark flow) lives in KV    
 via store.get_convo/set_convo. Watchlists are per-user (keyed by chat id).
 """
 import os
