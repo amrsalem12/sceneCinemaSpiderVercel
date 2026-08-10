@@ -30,6 +30,16 @@ TIME_CHOICES = [
     ("First showtime", "first"),
 ]
 
+# Date choices resolve to concrete YYYYMMDD (or "any") at save time.
+DATE_CHOICES = [
+    ("Any date", "any"),
+    ("Today", "today"),
+    ("Tomorrow", "tomorrow"),
+    ("This Friday", "friday"),
+    ("This weekend", "weekend"),
+    ("Within 7 days", "week"),
+]
+
 
 # ---------------- access control ----------------
 def is_member(user_id):
@@ -152,8 +162,29 @@ def handle_callback(chat_id, data):
         return telegram.send_message(chat_id, "Which showtimes?",
                                      buttons=[[(n, f"mt:{v}")] for n, v in TIME_CHOICES])
 
-    if action == "mt":                         # mt:<timeFilter> -> save watch
+    if action == "mt":                         # mt:<timeFilter> -> ask date
+        convo = store.get_convo(chat_id)
+        convo["timeFilter"] = parts[1]
+        convo["step"] = "date"
+        store.set_convo(chat_id, convo)
+        return telegram.send_message(chat_id, "Which date?",
+                                     buttons=[[(n, f"md:{v}")] for n, v in DATE_CHOICES])
+
+    if action == "md":                         # md:<dateChoice> -> save watch
         return save_watch(chat_id, parts[1])
+
+
+def _seat_label(seats):
+    """Human seat-availability label shown under each showtime."""
+    if seats is None:
+        return ""
+    if seats <= 0:
+        return "🔴 SOLD OUT"
+    if seats <= 5:
+        return f"🟠 {seats} left"
+    if seats <= 20:
+        return f"🟡 {seats} seats"
+    return f"🟢 {seats} seats"
 
 
 def show_showtimes(chat_id, chain, slug):
@@ -161,36 +192,106 @@ def show_showtimes(chat_id, chain, slug):
     try:
         if chain == "vox":
             b = vox.fetch_bundle()
+            # include sold-out too (only_available=False) so we can SHOW them as booked
             sess = vox.sessions_for(b, movie_slug=slug, time_filter="any",
-                                    only_available=True)
+                                    only_available=False)
+            title = vox.find_movie(b, slug=slug)
+            name = title["title"] if title else slug.replace("-", " ").title()
+
             if not sess:
-                return telegram.send_message(chat_id, "No available showtimes found.")
-            # show soonest ~12, each a deep-link book button
-            rows = [[(f"{s['cinema'][:16]} · {s['experience'][:8]} · {s['time']} "
-                      f"({s['seats']} seats)", s["bookingUrl"])] for s in sess[:12]]
-            return telegram.send_message(chat_id,
-                f"🎬 Showtimes (tap to book on VOX):", buttons=rows)
-        else:
-            # Scene: needs a date; show today's open days -> simplest: next open day
+                # movie exists but no sessions at all
+                return telegram.send_message(
+                    chat_id,
+                    f"🎬 <b>{name}</b>\n\nNo showtimes yet at VOX Almaza. "
+                    f"Want me to watch it and ping you when they open? Use /upcoming.")
+
+            # group by date for a cleaner read
+            from collections import OrderedDict
+            by_date = OrderedDict()
+            for x in sess:
+                by_date.setdefault(x["displayDate"], []).append(x)
+
+            lines = [f"🎬 <b>{name}</b> — VOX Almaza", ""]
+            rows = []
+            shown = 0
+            for d, items in list(by_date.items())[:4]:          # up to 4 days
+                ds = str(d)
+                lines.append(f"📅 <b>{ds[6:8]}/{ds[4:6]}</b>")
+                for x in items:
+                    lab = _seat_label(x["seats"])
+                    lines.append(f"   • {x['time']} · {x['experience']} — {lab}")
+                    # only make a tappable BOOK button for shows with seats
+                    if x["seats"] and x["seats"] > 0 and shown < 12:
+                        rows.append([(f"Book {x['time']} · {x['experience'][:6]}",
+                                      x["bookingUrl"])])
+                        shown += 1
+                lines.append("")
+            lines.append("Tap a button below to book (sold-out shows have no button).")
+            return telegram.send_message(chat_id, "\n".join(lines),
+                                         buttons=rows or None)
+
+        else:  # scene
             days = sorted(scene.open_days(slug))
+            name = slug.replace("-", " ").title()
             if not days:
-                return telegram.send_message(chat_id, "No open showtimes yet.")
+                return telegram.send_message(
+                    chat_id,
+                    f"🎬 <b>{name}</b>\n\nNo showtimes open yet at Scene CFC. "
+                    f"Use /upcoming to be notified when they open.")
             sess = scene.sessions_for(slug, days[0], time_filter="any")
-            rows = [[(f"{s['experience']} · {s['time']}", s["showtime_url"])]
-                    for s in sess[:12]]
-            return telegram.send_message(chat_id,
-                f"🎬 Scene showtimes {days[0]} (tap to book):", buttons=rows)
+            if not sess:
+                return telegram.send_message(
+                    chat_id, f"🎬 <b>{name}</b> — {days[0]}: no showtimes listed.")
+            lines = [f"🎬 <b>{name}</b> — Scene CFC · {days[0]}", ""]
+            rows = []
+            for x in sess[:12]:
+                lines.append(f"   • {x['time']} · {x['experience']}")
+                rows.append([(f"Book {x['time']} · {x['experience'][:6]}",
+                              x["showtime_url"])])
+            lines.append("\nTap to book on Scene.")
+            return telegram.send_message(chat_id, "\n".join(lines), buttons=rows)
     except Exception as e:
         return telegram.send_message(chat_id, f"Couldn't load showtimes: {e}")
 
 
-def save_watch(chat_id, time_filter):
+def _resolve_date_choice(choice):
+    """Turn a date choice into (dateValue, humanLabel).
+    dateValue is 'any', a single YYYYMMDD int, or a list of YYYYMMDD ints
+    (for weekend / within-7-days ranges)."""
+    from datetime import datetime, timedelta
+    now = datetime.utcnow() + timedelta(hours=int(os.getenv("TZ_OFFSET", "3")))
+    def ymd(d): return int(d.strftime("%Y%m%d"))
+    if choice == "any":
+        return "any", "any date"
+    if choice == "today":
+        return ymd(now), now.strftime("%a %d/%m")
+    if choice == "tomorrow":
+        d = now + timedelta(days=1)
+        return ymd(d), d.strftime("%a %d/%m")
+    if choice == "friday":
+        # next Friday (weekday 4), including today if it's Friday
+        ahead = (4 - now.weekday()) % 7
+        d = now + timedelta(days=ahead)
+        return ymd(d), d.strftime("Fri %d/%m")
+    if choice == "weekend":
+        # upcoming Fri+Sat (Egypt weekend)
+        fri = now + timedelta(days=(4 - now.weekday()) % 7)
+        sat = fri + timedelta(days=1)
+        return [ymd(fri), ymd(sat)], "this weekend"
+    if choice == "week":
+        return [ymd(now + timedelta(days=i)) for i in range(7)], "within 7 days"
+    return "any", "any date"
+
+
+def save_watch(chat_id, date_choice):
     convo = store.get_convo(chat_id)
     if not convo.get("slug"):
         return telegram.send_message(chat_id, "Something expired — try /upcoming again.")
     chain = convo["chain"]
     cinema_choice = convo.get("cinemaChoice", "any:any")  # "<chain>:<id>" or "any:any"
     cinemas = "any" if cinema_choice.startswith("any") else [cinema_choice.split(":")[1]]
+    time_filter = convo.get("timeFilter", "any")
+    date_val, date_label = _resolve_date_choice(date_choice)
 
     entry = {
         "chain": chain,
@@ -198,17 +299,18 @@ def save_watch(chat_id, time_filter):
         "movieTitle": convo["slug"].replace("-", " ").title(),
         "cinemas": cinemas,
         "mode": "release",
-        "date": "any",
+        "date": date_val,
+        "dateLabel": date_label,
         "timeFilter": time_filter,
     }
     store.add_watch(chat_id, entry)
     store.clear_convo(chat_id)
 
-    # auto-enable cron since there's now an active watch
     _sync_cron()
+    when = "" if date_val == "any" else f" for <b>{date_label}</b>"
     telegram.send_message(chat_id,
-        f"👀 Watching <b>{entry['movieTitle']}</b>. "
-        f"I'll ping you (loudly) the moment it opens for booking.")
+        f"👀 Watching <b>{entry['movieTitle']}</b>{when}. "
+        f"I'll ping you (loudly) the moment those showtimes open.")
 
 
 # ---------------- manage ----------------
@@ -220,8 +322,9 @@ def cmd_list(chat_id):
     for i, w in enumerate(wl, 1):
         cine = "any" if w["cinemas"] == "any" else ",".join(w["cinemas"])
         flag = " ⏰ OPEN" if w.get("alerted") else ""
+        dlabel = w.get("dateLabel", "any date")
         lines.append(f"{i}. {w['movieTitle']} [{w['chain']}] @ {cine} "
-                     f"({w['timeFilter']}){flag}")
+                     f"· {dlabel} · {w['timeFilter']}{flag}")
     lines.append("\n/booked &lt;n&gt; or /remove &lt;n&gt; to stop one.")
     telegram.send_message(chat_id, "\n".join(lines))
 
