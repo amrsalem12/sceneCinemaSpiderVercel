@@ -206,16 +206,9 @@ def _send_movie_card(chat_id, m):
 
 
 def _seat_label(seats):
-    """Human seat-availability label shown under each showtime."""
-    if seats is None:
-        return ""
-    if seats <= 0:
-        return "🔴 SOLD OUT"
-    if seats <= 5:
-        return f"🟠 {seats} left"
-    if seats <= 20:
-        return f"🟡 {seats} seats"
-    return f"🟢 {seats} seats"
+    """VOX's bundle exposes `seats` as a binary flag (1=available, 0=sold out).
+    Only flag sold-out shows; available ones get no tag (avoids fake counts)."""
+    return "🔴 Sold out" if seats is not None and seats <= 0 else ""
 
 
 def show_showtimes(chat_id, chain, slug):
@@ -266,7 +259,8 @@ def show_showtimes(chat_id, chain, slug):
                     lines.append(f"  <b>{exp}</b>")
                     for x in sorted(xs, key=lambda z: z["showtime"]):
                         lab = _seat_label(x["seats"])
-                        lines.append(f"     • {x['time']} — {lab}")
+                        suffix = f" — {lab}" if lab else ""
+                        lines.append(f"     • {x['time']}{suffix}")
                         if x["seats"] and x["seats"] > 0 and shown < 12:
                             rows.append([(f"Book {x['time']} · {exp[:6]}",
                                           x["bookingUrl"])])
