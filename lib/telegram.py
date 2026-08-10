@@ -1,6 +1,6 @@
 """
-Telegram helpers — send messages, inline-button keyboards, and answer callback
-taps. Shared by api/webhook.py (interactive) and api/check.py (alerts).
+Telegram helpers — send messages, inline-button keyboards, photos, and answer
+callback taps. Shared by api/webhook.py (interactive) and api/check.py (alerts).
 
 Env vars:
   TELEGRAM_TOKEN   bot token from @BotFather
@@ -8,6 +8,7 @@ Env vars:
 """
 import os
 import json
+import uuid
 import urllib.request
 
 TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -24,6 +25,35 @@ def _post(method: str, payload: dict) -> dict:
     )
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        return {"ok": False, "error": repr(e)}
+
+
+def _post_multipart(method: str, fields: dict, files: dict) -> dict:
+    """POST as multipart/form-data. `files` = {name: (filename, bytes, mime)}.
+    Needed to upload raw image bytes (sendPhoto with a file, not a URL)."""
+    if not TOKEN:
+        return {"ok": False, "skipped": "TELEGRAM_TOKEN not set"}
+    boundary = "----cinemabot" + uuid.uuid4().hex
+    body = bytearray()
+    for name, value in fields.items():
+        body += f"--{boundary}\r\n".encode()
+        body += f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode()
+        body += (str(value) + "\r\n").encode()
+    for name, (filename, content, mime) in files.items():
+        body += f"--{boundary}\r\n".encode()
+        body += (f'Content-Disposition: form-data; name="{name}"; '
+                 f'filename="{filename}"\r\n').encode()
+        body += f"Content-Type: {mime}\r\n\r\n".encode()
+        body += content + b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+    req = urllib.request.Request(
+        f"{_API}/{method}", data=bytes(body),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
             return json.loads(r.read().decode())
     except Exception as e:
         return {"ok": False, "error": repr(e)}
@@ -60,9 +90,22 @@ def _kb(buttons):
     return kb
 
 
-def send_photo(chat_id, photo_url, caption=None, buttons=None):
-    """Send a photo by URL with an optional caption + inline buttons."""
-    payload = {"chat_id": chat_id, "photo": photo_url}
+def send_photo(chat_id, photo, caption=None, buttons=None):
+    """Send a photo. `photo` may be:
+      - a URL or Telegram file_id (str)  -> JSON sendPhoto
+      - raw image bytes                  -> multipart upload
+    Optional caption + inline buttons."""
+    if isinstance(photo, (bytes, bytearray)):
+        fields = {"chat_id": chat_id}
+        if caption:
+            fields["caption"] = caption
+            fields["parse_mode"] = "HTML"
+        if buttons:
+            fields["reply_markup"] = json.dumps({"inline_keyboard": _kb(buttons)})
+        return _post_multipart("sendPhoto", fields,
+                               {"photo": ("seatmap.png", bytes(photo), "image/png")})
+
+    payload = {"chat_id": chat_id, "photo": photo}
     if caption:
         payload["caption"] = caption
         payload["parse_mode"] = "HTML"
