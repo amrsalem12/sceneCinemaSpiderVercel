@@ -82,6 +82,7 @@ def handle_update(update):
             "/showing — what's on now (book)\n"
             "/upcoming — watch a coming-soon movie\n"
             "/list — your watches\n"
+            "/status — how often I ping what I'm watching\n"
             "/remove &lt;n&gt; — stop a watch\n"
             "/booked &lt;n&gt; — mark booked, stop alerts")
     elif text.startswith("/showing"):
@@ -90,6 +91,8 @@ def handle_update(update):
         cmd_upcoming(chat_id)
     elif text.startswith("/list"):
         cmd_list(chat_id)
+    elif text.startswith("/status"):
+        cmd_status(chat_id)
     elif text.startswith("/remove"):
         cmd_stop(chat_id, text, booked=False)
     elif text.startswith("/booked"):
@@ -151,6 +154,9 @@ def handle_callback(chat_id, data):
 
     if action == "day":                        # day:<chain>:<slug>:<yyyymmdd>
         return show_day_showtimes(chat_id, parts[1], parts[2], parts[3])
+
+    if action == "statusiv":                   # statusiv:<seconds> (0 = off)
+        return set_status_interval(chat_id, int(parts[1]))
 
     if action == "seatmap":                    # seatmap:<showtimeId> (Scene, read-only)
         # tolerate ids that themselves contain ':' by rejoining the tail
@@ -431,6 +437,46 @@ def save_watch(chat_id, date_choice):
 
 
 # ---------------- manage ----------------
+DEFAULT_STATUS_SEC = 3600   # matches logic_check default when unset
+
+
+def _fmt_interval(secs):
+    """Human label for a status interval in seconds. None -> default; 0 -> off."""
+    if secs is None:
+        return "1 hour (default)"
+    secs = int(secs)
+    if secs <= 0:
+        return "off"
+    if secs % 3600 == 0:
+        h = secs // 3600
+        return f"{h} hour" + ("s" if h != 1 else "")
+    return f"{secs // 60} min"
+
+
+def cmd_status(chat_id):
+    """Show current heartbeat interval + tappable options to change it."""
+    cur = store._get(f"status_interval:{chat_id}", None)
+    telegram.send_message(
+        chat_id,
+        f"⏱ <b>Watcher updates</b>\n"
+        f"I quietly ping you what I'm watching every <b>{_fmt_interval(cur)}</b>.\n\n"
+        f"How often would you like them?",
+        buttons=[
+            [("Every 30 min", "statusiv:1800"), ("Every 1 hour", "statusiv:3600")],
+            [("Every 3 hours", "statusiv:10800"), ("Off", "statusiv:0")],
+        ])
+
+
+def set_status_interval(chat_id, secs):
+    store._set(f"status_interval:{chat_id}", int(secs))
+    store._set(f"status_ts:{chat_id}", 0)      # reset so the change takes effect next sweep
+    if secs <= 0:
+        msg = "🔕 Watcher updates turned <b>off</b>. You'll still get loud alerts when a movie opens."
+    else:
+        msg = f"✅ Watcher updates set to every <b>{_fmt_interval(secs)}</b>."
+    telegram.send_message(chat_id, msg)
+
+
 def cmd_list(chat_id):
     wl = store.get_watchlist(chat_id)
     if not wl:
