@@ -230,12 +230,13 @@ def _img_font(size, bold=False):
 
 def render_png(cells):
     """Render the seat plan to PNG bytes. `cells` is the raw /seat-plan data list.
-    Returns bytes, or None if PIL is unavailable or there are no seats."""
+    Returns bytes on success, or a string starting with 'ERR:' describing why it
+    couldn't (so callers can log it); returns None only if there are no seats."""
     try:
         import io
         from PIL import Image, ImageDraw
-    except Exception:
-        return None
+    except Exception as e:
+        return f"ERR: PIL import failed: {type(e).__name__}: {e}"
 
     seats, rowletter, cols, rowset = {}, {}, set(), set()
     for c in cells:
