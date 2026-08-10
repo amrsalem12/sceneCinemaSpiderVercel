@@ -391,8 +391,10 @@ def show_seatmap(chat_id, showtime_id):
     dbg = ""
     try:
         png = scene_seats.render_png(plan.get("cells") or [])
-        if not png:
-            dbg = "render_png returned None (Pillow import failed or no seats)"
+        if isinstance(png, str):            # 'ERR: ...' diagnostic
+            dbg = png
+        elif not png:
+            dbg = "render_png returned None (no seats parsed)"
         else:
             res = telegram.send_photo(chat_id, png, caption=caption)
             if isinstance(res, dict) and res.get("ok"):
