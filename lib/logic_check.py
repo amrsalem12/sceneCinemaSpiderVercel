@@ -37,25 +37,48 @@ def check_watch(bundle_cache, watch):
     slug = watch["movieSlug"]
     cinemas = watch.get("cinemas", "any")
     tf = watch.get("timeFilter", "any")
+    # date filter: "any", a single YYYYMMDD int, or a list of them
+    want_date = watch.get("date", "any")
+    date_set = None
+    if want_date != "any":
+        date_set = set(want_date) if isinstance(want_date, list) else {want_date}
 
     if chain == "vox":
         b = bundle_cache.get("vox")
         if b is None:
             b = bundle_cache["vox"] = vox.fetch_bundle()
-        sess = vox.sessions_for(b, movie_slug=slug, cinemas=cinemas,
-                                time_filter=tf, only_available=True)
+        # if a specific date is wanted, filter by each; else all dates
+        if date_set:
+            sess = []
+            for d in date_set:
+                sess += vox.sessions_for(b, movie_slug=slug, cinemas=cinemas,
+                                         display_date=d, time_filter=tf,
+                                         only_available=True)
+        else:
+            sess = vox.sessions_for(b, movie_slug=slug, cinemas=cinemas,
+                                    time_filter=tf, only_available=True)
         return [(f"{s['cinema'][:16]} · {s['experience'][:8]} · {s['time']} "
                  f"({s['seats']} left)", s["bookingUrl"]) for s in sess[:10]]
 
     # scene
     if not scene.is_bookable(slug):
         return []
-    days = sorted(scene.open_days(slug))
-    if not days:
+    open_days = sorted(scene.open_days(slug))
+    if not open_days:
         return []
-    sess = scene.sessions_for(slug, days[0], time_filter=tf)
-    return [(f"{s['experience']} · {s['time']}", s["showtime_url"])
-            for s in sess[:10]]
+    # map wanted YYYYMMDD -> scene's DD-MM-YYYY; if a date is wanted, only those
+    if date_set:
+        want_ddmm = {scene.to_ddmmyyyy(d) for d in date_set}
+        target_days = [d for d in open_days if d in want_ddmm]
+        if not target_days:
+            return []
+    else:
+        target_days = [open_days[0]]
+    hits = []
+    for d in target_days:
+        for x in scene.sessions_for(slug, d, time_filter=tf):
+            hits.append((f"{x['experience']} · {x['time']} ({d})", x["showtime_url"]))
+    return hits[:10]
 
 
 def run_sweep():
