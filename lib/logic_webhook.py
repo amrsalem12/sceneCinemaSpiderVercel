@@ -71,7 +71,8 @@ def handle_update(update):
         return
 
     if ev["kind"] == "callback":
-        telegram.answer_callback(ev["callback_id"])
+        toast = "Sold out" if ev["data"] == "soldout" else None
+        telegram.answer_callback(ev["callback_id"], text=toast)
         return handle_callback(chat_id, ev["data"])
 
     text = ev["text"]
@@ -152,6 +153,9 @@ def handle_callback(chat_id, data):
         # tolerate ids that themselves contain ':' by rejoining the tail
         return show_seatmap(chat_id, ":".join(parts[1:]))
 
+    if action == "soldout":                    # tapped a sold-out time — do nothing
+        return
+
     if action == "mark":                       # mark:<chain>:<slug> -> ask cinema
         store.set_convo(chat_id, {"chain": parts[1], "slug": parts[2],
                                   "step": "cinema"})
@@ -182,95 +186,52 @@ def handle_callback(chat_id, data):
     return telegram.send_message(chat_id, f"(unhandled tap: {data!r})")
 
 
-def _send_movie_card(chat_id, m):
-    """Poster + details caption + trailer button."""
-    bits = []
-    if m.get("rating"): bits.append(m["rating"])
-    if m.get("genre"): bits.append(m["genre"])
-    if m.get("runtime"): bits.append(f"{m['runtime']} min")
-    meta = " · ".join(bits)
-    lang = ""
-    if m.get("language"):
-        lang = f"\n🗣 {m['language']}"
-        if m.get("subtitles"): lang += f" · sub {m['subtitles']}"
-    caption = f"🎬 <b>{m['title']}</b>"
-    if meta: caption += f"\n{meta}"
-    caption += lang
-    buttons = None
-    if m.get("trailerUrl"):
-        buttons = [[("▶️ Trailer", m["trailerUrl"])]]
-    try:
-        telegram.send_photo(chat_id, m["posterUrl"], caption=caption, buttons=buttons)
-    except Exception:
-        telegram.send_message(chat_id, caption, buttons=buttons)
-
-
-def _seat_label(seats):
-    """VOX's bundle exposes `seats` as a binary flag (1=available, 0=sold out).
-    Only flag sold-out shows; available ones get no tag (avoids fake counts)."""
-    return "🔴 Sold out" if seats is not None and seats <= 0 else ""
-
-
 def show_showtimes(chat_id, chain, slug):
     telegram.send_message(chat_id, "Loading showtimes…")
     try:
         if chain == "vox":
             b = vox.fetch_bundle()
-            # include sold-out too (only_available=False) so we can SHOW them as booked
             sess = vox.sessions_for(b, movie_slug=slug, time_filter="any",
                                     only_available=False)
             movie = vox.find_movie(b, slug=slug)
             name = movie["title"] if movie else slug.replace("-", " ").title()
 
-            # rich movie card (poster + details + trailer) before showtimes
-            if movie and movie.get("posterUrl"):
-                _send_movie_card(chat_id, movie)
-
             if not sess:
-                # movie exists but no sessions at all
                 return telegram.send_message(
                     chat_id,
-                    f"🎬 <b>{name}</b>\n\nNo showtimes yet at VOX Almaza. "
-                    f"Want me to watch it and ping you when they open? Use /upcoming.")
+                    f"🎬 <b>{name}</b> — VOX Almaza\n"
+                    f"No showtimes yet. Use /upcoming to be pinged when they open.")
 
-            # group by date for a cleaner read
+            # one compact message per date; each time is a button.
+            # available -> books via deep link; sold out -> marked, non-booking.
             from collections import OrderedDict
             by_date = OrderedDict()
             for x in sess:
                 by_date.setdefault(x["displayDate"], []).append(x)
 
-            lines = [f"🎬 <b>{name}</b> — VOX Almaza", ""]
-            rows = []
-            shown = 0
-            # experience display order
-            EXP_ORDER = ["IMAX", "4DX", "MAX", "Gold", "Kids", "Standard"]
-            for d, items in list(by_date.items())[:4]:          # up to 4 days
+            for d, items in list(by_date.items())[:3]:      # nearest 3 dates
                 ds = str(d)
-                lines.append(f"📅 <b>{ds[6:8]}/{ds[4:6]}</b>")
-                # group this date's sessions by experience (screen type)
-                from collections import OrderedDict
-                by_exp = OrderedDict()
-                for x in items:
-                    by_exp.setdefault(x["experience"], []).append(x)
-                ordered = sorted(by_exp.items(),
-                                 key=lambda kv: (EXP_ORDER.index(kv[0])
-                                                 if kv[0] in EXP_ORDER else 99))
-                for exp, xs in ordered:
-                    lines.append(f"  <b>{exp}</b>")
-                    for x in sorted(xs, key=lambda z: z["showtime"]):
-                        lab = _seat_label(x["seats"])
-                        suffix = f" — {lab}" if lab else ""
-                        lines.append(f"     • {x['time']}{suffix}")
-                        if x["seats"] and x["seats"] > 0 and shown < 12:
-                            rows.append([(f"Book {x['time']} · {exp[:6]}",
-                                          x["bookingUrl"])])
-                            shown += 1
-                lines.append("")
-            lines.append("Tap a button below to book, or watch for a date "
-                         "that isn't open yet.")
-            rows.append([("⏰ Watch for another date", f"mark:vox:{slug}")])
-            return telegram.send_message(chat_id, "\n".join(lines),
-                                         buttons=rows or None)
+                header = (f"🎬 <b>{name}</b> — VOX Almaza\n"
+                          f"📅 {ds[6:8]}/{ds[4:6]} · tap a time to book")
+                row, btns = [], []
+                for x in sorted(items, key=lambda z: z["showtime"]):
+                    free = x["seats"] and x["seats"] > 0
+                    if free:
+                        label = f"{x['time']} · {x['experience'][:5]}"
+                        value = x["bookingUrl"]              # URL button -> book
+                    else:
+                        label = f"🔴 {x['time']} sold out"
+                        value = "soldout"                    # no-op callback
+                    row.append((label, value))
+                    if len(row) == 2:
+                        btns.append(row); row = []
+                if row:
+                    btns.append(row)
+                telegram.send_message(chat_id, header, buttons=btns)
+
+            return telegram.send_message(
+                chat_id, "Want a date that isn't listed yet?",
+                buttons=[[("⏰ Watch this movie", f"mark:vox:{slug}")]])
 
         else:  # scene
             days = sorted(scene.open_days(slug))
