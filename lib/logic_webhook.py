@@ -146,8 +146,11 @@ def handle_callback(chat_id, data):
     parts = data.split(":")
     action = parts[0]
 
-    if action == "show":                       # show:<chain>:<slug>
+    if action == "show":                       # show:<chain>:<slug> -> day picker
         return show_showtimes(chat_id, parts[1], parts[2])
+
+    if action == "day":                        # day:<chain>:<slug>:<yyyymmdd>
+        return show_day_showtimes(chat_id, parts[1], parts[2], parts[3])
 
     if action == "seatmap":                    # seatmap:<showtimeId> (Scene, read-only)
         # tolerate ids that themselves contain ':' by rejoining the tail
@@ -186,83 +189,107 @@ def handle_callback(chat_id, data):
     return telegram.send_message(chat_id, f"(unhandled tap: {data!r})")
 
 
+def _daylabel(yyyymmdd):
+    """'20260810' -> 'Sun 10/08'."""
+    from datetime import datetime
+    try:
+        return datetime.strptime(str(yyyymmdd), "%Y%m%d").strftime("%a %d/%m")
+    except Exception:
+        return str(yyyymmdd)
+
+
 def show_showtimes(chat_id, chain, slug):
+    """Step 1: after a film is picked, ask WHICH DAY — offering only days that
+    actually have showtimes. Picking a day fires day:<chain>:<slug>:<yyyymmdd>."""
+    telegram.send_message(chat_id, "Checking available days…")
+    try:
+        days = []  # list of yyyymmdd strings, ascending
+        if chain == "vox":
+            b = vox.fetch_bundle()
+            movie = vox.find_movie(b, slug=slug)
+            name = movie["title"] if movie else slug.replace("-", " ").title()
+            cinema = "VOX Almaza"
+            seen = set()
+            for x in sorted(vox.sessions_for(b, movie_slug=slug, time_filter="any",
+                                             only_available=False),
+                            key=lambda z: z["displayDate"]):
+                d = str(x["displayDate"])
+                if d not in seen:
+                    seen.add(d)
+                    days.append(d)
+        else:  # scene — open_days returns 'DD-MM-YYYY'
+            name = slug.replace("-", " ").title()
+            cinema = "Scene CFC"
+            for ddmm in scene.open_days(slug):
+                dd, mm, yyyy = ddmm.split("-")
+                days.append(f"{yyyy}{mm}{dd}")
+            days.sort()
+
+        if not days:
+            return telegram.send_message(
+                chat_id,
+                f"🎬 <b>{name}</b> — {cinema}\n"
+                f"No showtimes yet. Use /upcoming to be pinged when they open.")
+
+        rows = [[(_daylabel(d), f"day:{chain}:{slug}:{d}")] for d in days[:10]]
+        rows.append([("⏰ Watch for another date", f"mark:{chain}:{slug}")])
+        return telegram.send_message(
+            chat_id, f"🎬 <b>{name}</b> — {cinema}\nWhich day do you want to go?",
+            buttons=rows)
+    except Exception as e:
+        return telegram.send_message(chat_id, f"Couldn't load days: {e}")
+
+
+def show_day_showtimes(chat_id, chain, slug, yyyymmdd):
+    """Step 2: show one day's showtimes as tap-to-book buttons
+    (VOX marks sold-out; Scene adds a 🗺 seat-map button per show)."""
     telegram.send_message(chat_id, "Loading showtimes…")
+    daylbl = _daylabel(yyyymmdd)
     try:
         if chain == "vox":
             b = vox.fetch_bundle()
-            sess = vox.sessions_for(b, movie_slug=slug, time_filter="any",
-                                    only_available=False)
             movie = vox.find_movie(b, slug=slug)
             name = movie["title"] if movie else slug.replace("-", " ").title()
-
+            sess = vox.sessions_for(b, movie_slug=slug, display_date=int(yyyymmdd),
+                                    time_filter="any", only_available=False)
             if not sess:
                 return telegram.send_message(
-                    chat_id,
-                    f"🎬 <b>{name}</b> — VOX Almaza\n"
-                    f"No showtimes yet. Use /upcoming to be pinged when they open.")
-
-            # one compact message per date; each time is a button.
-            # available -> books via deep link; sold out -> marked, non-booking.
-            from collections import OrderedDict
-            by_date = OrderedDict()
-            for x in sess:
-                by_date.setdefault(x["displayDate"], []).append(x)
-
-            for d, items in list(by_date.items())[:3]:      # nearest 3 dates
-                ds = str(d)
-                header = (f"🎬 <b>{name}</b> — VOX Almaza\n"
-                          f"📅 {ds[6:8]}/{ds[4:6]} · tap a time to book")
-                row, btns = [], []
-                for x in sorted(items, key=lambda z: z["showtime"]):
-                    free = x["seats"] and x["seats"] > 0
-                    exp = x["experience"]                    # full name: Standard/Gold/4DX/IMAX…
-                    if free:
-                        label = f"{x['time']} · {exp}"
-                        value = x["bookingUrl"]              # URL button -> book
-                    else:
-                        label = f"🔴 {x['time']} · {exp} — sold out"
-                        value = "soldout"                    # no-op callback
-                    btns.append([(label, value)])            # one time per row (full label fits)
-                telegram.send_message(chat_id, header, buttons=btns)
-
+                    chat_id, f"🎬 <b>{name}</b> — VOX Almaza · {daylbl}\n"
+                             f"No showtimes for that day.")
+            rows = []
+            for x in sorted(sess, key=lambda z: z["showtime"]):
+                free = x["seats"] and x["seats"] > 0
+                exp = x["experience"]
+                if free:
+                    rows.append([(f"{x['time']} · {exp}", x["bookingUrl"])])
+                else:
+                    rows.append([(f"🔴 {x['time']} · {exp} — sold out", "soldout")])
             return telegram.send_message(
-                chat_id, "Want a date that isn't listed yet?",
-                buttons=[[("⏰ Watch this movie", f"mark:vox:{slug}")]])
+                chat_id,
+                f"🎬 <b>{name}</b> — VOX Almaza · {daylbl}\nTap a time to book:",
+                buttons=rows)
 
         else:  # scene
-            days = sorted(scene.open_days(slug))
             name = slug.replace("-", " ").title()
-            if not days:
-                return telegram.send_message(
-                    chat_id,
-                    f"🎬 <b>{name}</b>\n\nNo showtimes open yet at Scene CFC. "
-                    f"Use /upcoming to be notified when they open.")
-            sess = scene.sessions_for(slug, days[0], time_filter="any")
+            ddmm = scene.to_ddmmyyyy(int(yyyymmdd))          # -> 'DD-MM-YYYY'
+            sess = scene.sessions_for(slug, ddmm, time_filter="any")
             if not sess:
                 return telegram.send_message(
-                    chat_id, f"🎬 <b>{name}</b> — {days[0]}: no showtimes listed.")
-            lines = [f"🎬 <b>{name}</b> — Scene CFC · {days[0]}", ""]
+                    chat_id, f"🎬 <b>{name}</b> — Scene CFC · {daylbl}\n"
+                             f"No showtimes for that day.")
             rows = []
-            for x in sess[:8]:
-                lines.append(f"   • {x['time']} · {x['experience']}")
-                # showtime id is the tail of the showtime_url (e.g. .../booking-<id>).
-                # split off any query string first, then take the trailing digits.
+            for x in sess[:10]:
                 raw = x["showtime_url"].split("?")[0].rstrip("/")
-                # Scene showtime id is a 24-char hex ObjectId in the URL:
-                #   https://cfc.scenecinemas.com/showtime-<hexid>  (or booking-<hexid>)
                 m = re.search(r"(?:showtime|booking)-([0-9a-f]{24})", raw)
                 stid = m.group(1) if m else None
-                seat_btn = (f"🗺 Seats {x['time']}", f"seatmap:{stid}") if stid else \
-                           (f"🗺 Seats {x['time']}", "seatmap:BADID")
-                rows.append([
-                    seat_btn,
-                    (f"Book {x['time'][:5]}", x["showtime_url"]),
-                ])
-            lines.append("\nTap 🗺 to see the seat map, or Book to go to Scene. "
-                         "You can also watch for a date that isn't open yet.")
-            rows.append([("⏰ Watch for another date", f"mark:scene:{slug}")])
-            return telegram.send_message(chat_id, "\n".join(lines), buttons=rows)
+                seat_btn = (f"🗺 {x['time']} · {x['experience']}",
+                            f"seatmap:{stid}" if stid else "seatmap:BADID")
+                rows.append([seat_btn, ("Book", x["showtime_url"])])
+            return telegram.send_message(
+                chat_id,
+                f"🎬 <b>{name}</b> — Scene CFC · {daylbl}\n"
+                f"🗺 = see seats · Book = go to Scene:",
+                buttons=rows)
     except Exception as e:
         return telegram.send_message(chat_id, f"Couldn't load showtimes: {e}")
 
