@@ -366,6 +366,7 @@ def _dates_already_open(chain, slug, cinemas, dates):
 
 def show_seatmap(chat_id, showtime_id):
     """Scene only: fetch + render the live seat map (read-only, holds nothing).
+    Sends a PNG (phone-friendly); falls back to the text grid if image render fails.
 
     While debugging: reports WHY it failed instead of a generic message.
     Once it works, trim the debug branches back to a plain fallback.
@@ -378,14 +379,24 @@ def show_seatmap(chat_id, showtime_id):
         return telegram.send_message(
             chat_id, f"seatmap crash:\n{traceback.format_exc()[-600:]}")
 
-    # error dict (if fetch_seat_plan was updated to return {"error": ...})
     if isinstance(plan, dict) and plan.get("error"):
         return telegram.send_message(chat_id, f"seatmap debug: {plan['error']}")
 
-    # empty / no rows -> show what actually came back
     if not plan or not plan.get("rows"):
         return telegram.send_message(chat_id, f"seatmap debug: empty plan -> {plan!r}")
 
+    caption = f"🟩 {plan['free']} free · ⬛ {plan['taken']} taken — pick your seats on Scene."
+    # try the image first; fall back to the text grid if PIL/render fails
+    png = None
+    try:
+        png = scene_seats.render_png(plan.get("cells") or [])
+    except Exception:
+        png = None
+    if png:
+        try:
+            return telegram.send_photo(chat_id, png, caption=caption)
+        except Exception:
+            pass  # fall through to text
     telegram.send_message(chat_id, scene_seats.render_text(plan))
 
 
