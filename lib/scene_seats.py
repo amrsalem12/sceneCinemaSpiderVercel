@@ -257,7 +257,9 @@ def render_png(cells):
         return None
 
     min_c, max_c = min(cols), max(cols)
-    rows = sorted(rowset)                      # A (front) at top
+    # sort by the ROW LETTER (A=front,...) not the grid row number — Scene's grid
+    # numbers run back-to-front, so sorting by number flips the map upside down.
+    rows = sorted(rowset, key=lambda r: rowletter.get(r, chr(0x7f) + str(r)))
     ncol = max_c - min_c + 1
 
     CELL, GAP, PAD, LBL, TOP = 34, 6, 28, 26, 70
