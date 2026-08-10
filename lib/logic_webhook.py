@@ -297,11 +297,14 @@ def show_showtimes(chat_id, chain, slug):
                 # showtime id is the tail of the showtime_url (e.g. .../booking-<id>).
                 # split off any query string first, then take the trailing digits.
                 raw = x["showtime_url"].split("?")[0].rstrip("/")
-                tail = raw.split("/")[-1]
-                m = re.search(r"(\d+)$", tail)          # trailing number = the showtime id
-                stid = m.group(1) if m else tail
+                # Scene showtime id is a 24-char hex ObjectId in the URL:
+                #   https://cfc.scenecinemas.com/showtime-<hexid>  (or booking-<hexid>)
+                m = re.search(r"(?:showtime|booking)-([0-9a-f]{24})", raw)
+                stid = m.group(1) if m else None
+                seat_btn = (f"🗺 Seats {x['time']}", f"seatmap:{stid}") if stid else \
+                           (f"🗺 Seats {x['time']}", "seatmap:BADID")
                 rows.append([
-                    (f"🗺 Seats {x['time']}", f"seatmap:{stid}"),
+                    seat_btn,
                     (f"Book {x['time'][:5]}", x["showtime_url"]),
                 ])
             lines.append("\nTap 🗺 to see the seat map, or Book to go to Scene. "
