@@ -98,24 +98,36 @@ def _watch_summary(wl, open_ids):
     return "\n".join(lines)
 
 
-def _maybe_send_status(chat_id, wl, open_ids):
-    """Send the status at most once per the user's chosen interval, silently.
-    Interval is set from Telegram via /status (key status_interval:<chat_id>):
-    seconds, 0 = off, unset = STATUS_EVERY default."""
+def _maybe_send_status(chat_id, wl, open_ids, summary):
+    """Send the status at most once per the user's chosen interval.
+    Interval set from Telegram via /status (key status_interval:<chat_id>):
+    seconds, 0 = off, unset = STATUS_EVERY default. Records why it did/didn't
+    send into summary['status_debug'] so /api/check reveals the gate state."""
     iv = store._get(f"status_interval:{chat_id}", None)
     iv = STATUS_EVERY if iv is None else int(iv)
-    if iv <= 0:
-        return False                            # user turned updates off
     now_ts = time.time()
     try:
         last = float(store._get(f"status_ts:{chat_id}", 0) or 0)
     except (TypeError, ValueError):
         last = 0
-    if now_ts - last < iv - 60:                 # small tolerance to avoid drift
-        return False
-    telegram.send_message(chat_id, _watch_summary(wl, open_ids), silent=True)
-    store._set(f"status_ts:{chat_id}", now_ts)
-    return True
+    since = round(now_ts - last)
+    dbg = {"chat": str(chat_id)[-4:], "interval_s": iv, "since_last_s": since}
+
+    if iv <= 0:
+        dbg["decision"] = "off"
+    elif since < iv - 60:                       # small tolerance to avoid drift
+        dbg["decision"] = f"wait {iv - 60 - since}s"
+    else:
+        res = telegram.send_message(chat_id, _watch_summary(wl, open_ids),
+                                    silent=False)     # notify — this is the ping
+        ok = isinstance(res, dict) and res.get("ok")
+        if ok:
+            store._set(f"status_ts:{chat_id}", now_ts)
+            dbg["decision"] = "SENT"
+        else:
+            dbg["decision"] = f"send_failed: {res}"
+    summary.setdefault("status_debug", []).append(dbg)
+    return dbg.get("decision") == "SENT"
 
 
 def run_sweep():
@@ -153,7 +165,7 @@ def run_sweep():
                 summary["alerts"] += 1
 
         # quiet hourly heartbeat of what we're watching for this user
-        if _maybe_send_status(chat_id, wl, open_ids):
+        if _maybe_send_status(chat_id, wl, open_ids, summary):
             summary["status_sent"] += 1
 
     # auto-disable cron if nothing left to watch anywhere
