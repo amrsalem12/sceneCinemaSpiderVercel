@@ -214,19 +214,32 @@ def show_showtimes(chat_id, chain, slug):
             lines = [f"🎬 <b>{name}</b> — VOX Almaza", ""]
             rows = []
             shown = 0
+            # experience display order
+            EXP_ORDER = ["IMAX", "4DX", "MAX", "Gold", "Kids", "Standard"]
             for d, items in list(by_date.items())[:4]:          # up to 4 days
                 ds = str(d)
                 lines.append(f"📅 <b>{ds[6:8]}/{ds[4:6]}</b>")
+                # group this date's sessions by experience (screen type)
+                from collections import OrderedDict
+                by_exp = OrderedDict()
                 for x in items:
-                    lab = _seat_label(x["seats"])
-                    lines.append(f"   • {x['time']} · {x['experience']} — {lab}")
-                    # only make a tappable BOOK button for shows with seats
-                    if x["seats"] and x["seats"] > 0 and shown < 12:
-                        rows.append([(f"Book {x['time']} · {x['experience'][:6]}",
-                                      x["bookingUrl"])])
-                        shown += 1
+                    by_exp.setdefault(x["experience"], []).append(x)
+                ordered = sorted(by_exp.items(),
+                                 key=lambda kv: (EXP_ORDER.index(kv[0])
+                                                 if kv[0] in EXP_ORDER else 99))
+                for exp, xs in ordered:
+                    lines.append(f"  <b>{exp}</b>")
+                    for x in sorted(xs, key=lambda z: z["showtime"]):
+                        lab = _seat_label(x["seats"])
+                        lines.append(f"     • {x['time']} — {lab}")
+                        if x["seats"] and x["seats"] > 0 and shown < 12:
+                            rows.append([(f"Book {x['time']} · {exp[:6]}",
+                                          x["bookingUrl"])])
+                            shown += 1
                 lines.append("")
-            lines.append("Tap a button below to book (sold-out shows have no button).")
+            lines.append("Tap a button below to book, or watch for a date "
+                         "that isn't open yet.")
+            rows.append([("⏰ Watch for another date", f"mark:vox:{slug}")])
             return telegram.send_message(chat_id, "\n".join(lines),
                                          buttons=rows or None)
 
@@ -248,7 +261,9 @@ def show_showtimes(chat_id, chain, slug):
                 lines.append(f"   • {x['time']} · {x['experience']}")
                 rows.append([(f"Book {x['time']} · {x['experience'][:6]}",
                               x["showtime_url"])])
-            lines.append("\nTap to book on Scene.")
+            lines.append("\nTap to book on Scene, or watch for a date that "
+                         "isn't open yet.")
+            rows.append([("⏰ Watch for another date", f"mark:scene:{slug}")])
             return telegram.send_message(chat_id, "\n".join(lines), buttons=rows)
     except Exception as e:
         return telegram.send_message(chat_id, f"Couldn't load showtimes: {e}")
