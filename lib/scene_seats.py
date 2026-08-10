@@ -167,13 +167,32 @@ def render_text(plan, max_rows=20):
     """Render the plan as a compact text grid: 🟩 free, 🟥 taken."""
     if not plan or not plan.get("rows"):
         return "Couldn't load the seat map."
-    lines = ["<b>Seat map</b>  🟩 free · 🟥 taken", "<i>— SCREEN —</i>", ""]
-    # rows come back with letter labels; sort A..N (front to back)
-    for letter in sorted(plan["rows"].keys())[:max_rows]:
-        seats = plan["rows"][letter]
-        strip = "".join("🟩" if free else "🟥" for _, _, free in seats)
-        lines.append(f"<b>{letter:>2}</b> {strip}")
+
+    rows = plan["rows"]  # {letter: [(col, label, free), ...]}
+    # global column span so every row lines up vertically (aisles included)
+    all_cols = [col for seats in rows.values() for col, _, _ in seats]
+    if not all_cols:
+        return "Couldn't load the seat map."
+    min_c, max_c = min(all_cols), max(all_cols)
+
+    AISLE = "\u3000"  # fullwidth space: same width as an emoji, renders as a gap
+    lines = ["<b>Seat map</b>   🟩 free · 🟥 taken",
+             "<i>———— SCREEN ————</i>", ""]
+
+    # rows are usually front(A)->back(N); show back rows at the bottom by
+    # reversing, so the SCREEN header sits above the front rows
+    for letter in sorted(rows.keys(), reverse=True)[:max_rows]:
+        seat_at = {col: free for col, _, free in rows[letter]}
+        strip = "".join(
+            ("🟩" if seat_at[c] else "🟥") if c in seat_at else AISLE
+            for c in range(min_c, max_c + 1)
+        )
+        nfree = sum(1 for v in seat_at.values() if v)
+        tag = f"  ({nfree})" if nfree else ""
+        lines.append(f"<b>{letter:>2}</b> {strip}{tag}")
+
     lines.append("")
     lines.append(f"🟩 {plan['free']} free · 🟥 {plan['taken']} taken")
-    lines.append("\nPick your seats on Scene when you book.")
+    lines.append("\nNumbers in () = free seats in that row. "
+                 "Pick your seats on Scene when you book.")
     return "\n".join(lines)
