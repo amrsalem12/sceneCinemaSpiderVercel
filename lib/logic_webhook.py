@@ -386,17 +386,23 @@ def show_seatmap(chat_id, showtime_id):
         return telegram.send_message(chat_id, f"seatmap debug: empty plan -> {plan!r}")
 
     caption = f"🟩 {plan['free']} free · ⬛ {plan['taken']} taken — pick your seats on Scene."
-    # try the image first; fall back to the text grid if PIL/render fails
-    png = None
+    # try the image first; fall back to the text grid if PIL/render/upload fails.
+    # (debug: report the reason so we can see why the image didn't send)
+    dbg = ""
     try:
         png = scene_seats.render_png(plan.get("cells") or [])
+        if not png:
+            dbg = "render_png returned None (Pillow import failed or no seats)"
+        else:
+            res = telegram.send_photo(chat_id, png, caption=caption)
+            if isinstance(res, dict) and res.get("ok"):
+                return
+            dbg = f"send_photo failed: {res}"
     except Exception:
-        png = None
-    if png:
-        try:
-            return telegram.send_photo(chat_id, png, caption=caption)
-        except Exception:
-            pass  # fall through to text
+        import traceback
+        dbg = "render/upload crash: " + traceback.format_exc()[-400:]
+
+    telegram.send_message(chat_id, f"[img debug] {dbg}")
     telegram.send_message(chat_id, scene_seats.render_text(plan))
 
 
