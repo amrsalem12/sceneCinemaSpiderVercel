@@ -11,6 +11,7 @@ Stateless per request: conversation state (the /upcoming mark flow) lives in KV
 via store.get_convo/set_convo. Watchlists are per-user (keyed by chat id).
 """
 import os
+import re
 import sys
 import json
 
@@ -148,7 +149,8 @@ def handle_callback(chat_id, data):
         return show_showtimes(chat_id, parts[1], parts[2])
 
     if action == "seatmap":                    # seatmap:<showtimeId> (Scene, read-only)
-        return show_seatmap(chat_id, parts[1])
+        # tolerate ids that themselves contain ':' by rejoining the tail
+        return show_seatmap(chat_id, ":".join(parts[1:]))
 
     if action == "mark":                       # mark:<chain>:<slug> -> ask cinema
         store.set_convo(chat_id, {"chain": parts[1], "slug": parts[2],
@@ -175,6 +177,9 @@ def handle_callback(chat_id, data):
 
     if action == "md":                         # md:<dateChoice> -> save watch
         return save_watch(chat_id, parts[1])
+
+    # nothing matched -> say so instead of silently doing nothing
+    return telegram.send_message(chat_id, f"(unhandled tap: {data!r})")
 
 
 def _send_movie_card(chat_id, m):
@@ -289,8 +294,12 @@ def show_showtimes(chat_id, chain, slug):
             rows = []
             for x in sess[:8]:
                 lines.append(f"   • {x['time']} · {x['experience']}")
-                # showtime id is the tail of the showtime_url (…/showtime-<id>)
-                stid = x["showtime_url"].rstrip("/").split("-")[-1]
+                # showtime id is the tail of the showtime_url (e.g. .../booking-<id>).
+                # split off any query string first, then take the trailing digits.
+                raw = x["showtime_url"].split("?")[0].rstrip("/")
+                tail = raw.split("/")[-1]
+                m = re.search(r"(\d+)$", tail)          # trailing number = the showtime id
+                stid = m.group(1) if m else tail
                 rows.append([
                     (f"🗺 Seats {x['time']}", f"seatmap:{stid}"),
                     (f"Book {x['time'][:5]}", x["showtime_url"]),
@@ -353,16 +362,28 @@ def _dates_already_open(chain, slug, cinemas, dates):
 
 
 def show_seatmap(chat_id, showtime_id):
-    """Scene only: fetch + render the live seat map (read-only, holds nothing)."""
-    telegram.send_message(chat_id, "Loading seat map…")
+    """Scene only: fetch + render the live seat map (read-only, holds nothing).
+
+    While debugging: reports WHY it failed instead of a generic message.
+    Once it works, trim the debug branches back to a plain fallback.
+    """
+    telegram.send_message(chat_id, f"Loading seat map… (id={showtime_id})")
     try:
         plan = scene_seats.fetch_seat_plan(showtime_id)
-        if not plan:
-            return telegram.send_message(chat_id,
-                "Couldn't load the seat map for that showtime.")
-        telegram.send_message(chat_id, scene_seats.render_text(plan))
-    except Exception as e:
-        telegram.send_message(chat_id, f"Seat map unavailable: {e}")
+    except Exception:
+        import traceback
+        return telegram.send_message(
+            chat_id, f"seatmap crash:\n{traceback.format_exc()[-600:]}")
+
+    # error dict (if fetch_seat_plan was updated to return {"error": ...})
+    if isinstance(plan, dict) and plan.get("error"):
+        return telegram.send_message(chat_id, f"seatmap debug: {plan['error']}")
+
+    # empty / no rows -> show what actually came back
+    if not plan or not plan.get("rows"):
+        return telegram.send_message(chat_id, f"seatmap debug: empty plan -> {plan!r}")
+
+    telegram.send_message(chat_id, scene_seats.render_text(plan))
 
 
 def save_watch(chat_id, date_choice):
