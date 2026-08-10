@@ -121,7 +121,11 @@ def fetch_seat_plan(showtime_id):
         except ValueError:
             return {"error": f"seat-plan returned non-JSON (len={len(resp)}, "
                              f"head={resp[:80]!r})"}
-        return _parse_grid(payload.get("data", []))
+        cells = payload.get("data", [])
+        plan = _parse_grid(cells)
+        if isinstance(plan, dict) and "rows" in plan:
+            plan["cells"] = cells        # raw cells kept for the PNG renderer
+        return plan
     except (urllib.error.HTTPError, urllib.error.URLError, socket.timeout,
             TimeoutError) as e:
         return {"error": f"{type(e).__name__}: {e}"}
@@ -179,9 +183,9 @@ def render_text(plan, max_rows=20):
     lines = ["<b>Seat map</b>   🟩 free · 🟥 taken",
              "<i>———— SCREEN ————</i>", ""]
 
-    # rows are usually front(A)->back(N); show back rows at the bottom by
-    # reversing, so the SCREEN header sits above the front rows
-    for letter in sorted(rows.keys(), reverse=True)[:max_rows]:
+    # rows run front(A, nearest screen) -> back; show A at the top, directly
+    # under the SCREEN header, matching how Scene's own map is oriented
+    for letter in sorted(rows.keys())[:max_rows]:
         seat_at = {col: free for col, _, free in rows[letter]}
         strip = "".join(
             ("🟩" if seat_at[c] else "🟥") if c in seat_at else AISLE
@@ -196,3 +200,98 @@ def render_text(plan, max_rows=20):
     lines.append("\nNumbers in () = free seats in that row. "
                  "Pick your seats on Scene when you book.")
     return "\n".join(lines)
+
+
+# ---------------- image rendering (phone-friendly PNG) ----------------
+# Text grids wrap on phones once a hall gets wide; a PNG scales and never wraps.
+# render_png() returns raw PNG bytes for telegram.send_photo, or None on failure
+# (callers should fall back to render_text).
+_IMG_BG     = (14, 15, 18)
+_IMG_FREE   = (46, 160, 67)     # green  = available
+_IMG_TAKEN  = (60, 63, 70)      # gray   = occupied
+_IMG_SCREEN = (120, 130, 150)
+_IMG_SUBTLE = (120, 125, 135)
+_IMG_WHITE  = (255, 255, 255)
+
+
+def _img_font(size, bold=False):
+    from PIL import ImageFont
+    for path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold
+        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
+    ):
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def render_png(cells):
+    """Render the seat plan to PNG bytes. `cells` is the raw /seat-plan data list.
+    Returns bytes, or None if PIL is unavailable or there are no seats."""
+    try:
+        import io
+        from PIL import Image, ImageDraw
+    except Exception:
+        return None
+
+    seats, rowletter, cols, rowset = {}, {}, set(), set()
+    for c in cells:
+        m = re.match(r"grid-(\d+)-(\d+)", c.get("app_id", ""))
+        if not m:
+            continue
+        r, col = int(m.group(1)), int(m.group(2))
+        st = c.get("st", "")
+        if st == "SeatRowTitle":
+            lbl = (c.get("st_txt") or "").strip()
+            if lbl:
+                rowletter[r] = lbl
+        elif st in ("Standard", "Occupied"):
+            seats[(r, col)] = (st == "Standard", (c.get("st_txt") or "").strip())
+            cols.add(col)
+            rowset.add(r)
+    if not seats:
+        return None
+
+    min_c, max_c = min(cols), max(cols)
+    rows = sorted(rowset)                      # A (front) at top
+    ncol = max_c - min_c + 1
+
+    CELL, GAP, PAD, LBL, TOP = 34, 6, 28, 26, 70
+    W = PAD * 2 + LBL * 2 + ncol * CELL + (ncol - 1) * GAP
+    H = TOP + PAD + len(rows) * CELL + (len(rows) - 1) * GAP + PAD
+    img = Image.new("RGB", (W, H), _IMG_BG)
+    d = ImageDraw.Draw(img)
+
+    # screen bar + label
+    d.rounded_rectangle([PAD + LBL, 26, W - PAD - LBL, 34], radius=4, fill=_IMG_SCREEN)
+    fscreen = _img_font(18, bold=True)
+    tw = d.textlength("SCREEN", font=fscreen)
+    d.text(((W - tw) / 2, 6), "SCREEN", font=fscreen, fill=_IMG_SCREEN)
+
+    fseat, flabel = _img_font(13), _img_font(16, bold=True)
+    x0 = PAD + LBL
+    for ri, r in enumerate(rows):
+        y = TOP + ri * (CELL + GAP)
+        letter = rowletter.get(r, str(r))
+        d.text((PAD - 2, y + CELL / 2 - 9), letter, font=flabel, fill=_IMG_SUBTLE)
+        d.text((W - PAD - LBL + 8, y + CELL / 2 - 9), letter, font=flabel, fill=_IMG_SUBTLE)
+        for ci, col in enumerate(range(min_c, max_c + 1)):
+            cell = seats.get((r, col))
+            if not cell:
+                continue                       # aisle / gap
+            is_free, label = cell
+            x = x0 + ci * (CELL + GAP)
+            d.rounded_rectangle([x, y, x + CELL, y + CELL], radius=7,
+                                fill=_IMG_FREE if is_free else _IMG_TAKEN)
+            if is_free and label:
+                num = "".join(ch for ch in label if ch.isdigit()) or label
+                tw = d.textlength(num, font=fseat)
+                d.text((x + (CELL - tw) / 2, y + CELL / 2 - 8), num,
+                       font=fseat, fill=_IMG_WHITE)
+
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
