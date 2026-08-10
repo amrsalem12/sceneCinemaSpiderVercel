@@ -298,6 +298,26 @@ def _resolve_date_choice(choice):
     return "any", "any date"
 
 
+def _dates_already_open(chain, slug, cinemas, dates):
+    """Return the subset of `dates` (YYYYMMDD ints) that already have showtimes."""
+    open_now = []
+    try:
+        if chain == "vox":
+            b = vox.fetch_bundle()
+            for d in dates:
+                if vox.sessions_for(b, movie_slug=slug, cinemas=cinemas,
+                                    display_date=d, time_filter="any"):
+                    open_now.append(d)
+        else:  # scene
+            opendays = scene.open_days(slug)
+            for d in dates:
+                if scene.to_ddmmyyyy(d) in opendays:
+                    open_now.append(d)
+    except Exception:
+        pass          # if the check fails, fall through and just set the watch
+    return open_now
+
+
 def save_watch(chat_id, date_choice):
     convo = store.get_convo(chat_id)
     if not convo.get("slug"):
@@ -307,6 +327,19 @@ def save_watch(chat_id, date_choice):
     cinemas = "any" if cinema_choice.startswith("any") else [cinema_choice.split(":")[1]]
     time_filter = convo.get("timeFilter", "any")
     date_val, date_label = _resolve_date_choice(date_choice)
+    slug = convo["slug"]
+
+    # If a SPECIFIC date is chosen and it's ALREADY open, don't set a pointless
+    # watch — just show those showtimes now.
+    if date_val != "any":
+        dates = date_val if isinstance(date_val, list) else [date_val]
+        already = _dates_already_open(chain, slug, cinemas, dates)
+        if already:
+            store.clear_convo(chat_id)
+            telegram.send_message(chat_id,
+                f"📅 <b>{date_label}</b> is already open for booking — "
+                f"here are the showtimes (no watch needed):")
+            return show_showtimes(chat_id, chain, slug)
 
     entry = {
         "chain": chain,
