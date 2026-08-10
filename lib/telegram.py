@@ -60,6 +60,17 @@ def _kb(buttons):
     return kb
 
 
+def send_photo(chat_id, photo_url, caption=None, buttons=None):
+    """Send a photo by URL with an optional caption + inline buttons."""
+    payload = {"chat_id": chat_id, "photo": photo_url}
+    if caption:
+        payload["caption"] = caption
+        payload["parse_mode"] = "HTML"
+    if buttons:
+        payload["reply_markup"] = {"inline_keyboard": _kb(buttons)}
+    return _post("sendPhoto", payload)
+
+
 def answer_callback(callback_query_id, text=None):
     """Acknowledge a button tap (stops Telegram's loading spinner)."""
     payload = {"callback_query_id": callback_query_id}
