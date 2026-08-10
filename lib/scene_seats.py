@@ -281,7 +281,9 @@ def render_png(cells):
         letter = rowletter.get(r, str(r))
         d.text((PAD - 2, y + CELL / 2 - 9), letter, font=flabel, fill=_IMG_SUBTLE)
         d.text((W - PAD - LBL + 8, y + CELL / 2 - 9), letter, font=flabel, fill=_IMG_SUBTLE)
-        for ci, col in enumerate(range(min_c, max_c + 1)):
+        # draw columns right-to-left: Scene's grid col numbers run opposite to the
+        # visual layout (higher col = lower seat number), so mirror the placement.
+        for ci, col in enumerate(range(max_c, min_c - 1, -1)):
             cell = seats.get((r, col))
             if not cell:
                 continue                       # aisle / gap
