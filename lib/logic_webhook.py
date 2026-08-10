@@ -216,17 +216,14 @@ def show_showtimes(chat_id, chain, slug):
                 row, btns = [], []
                 for x in sorted(items, key=lambda z: z["showtime"]):
                     free = x["seats"] and x["seats"] > 0
+                    exp = x["experience"]                    # full name: Standard/Gold/4DX/IMAX…
                     if free:
-                        label = f"{x['time']} · {x['experience'][:5]}"
+                        label = f"{x['time']} · {exp}"
                         value = x["bookingUrl"]              # URL button -> book
                     else:
-                        label = f"🔴 {x['time']} sold out"
+                        label = f"🔴 {x['time']} · {exp} — sold out"
                         value = "soldout"                    # no-op callback
-                    row.append((label, value))
-                    if len(row) == 2:
-                        btns.append(row); row = []
-                if row:
-                    btns.append(row)
+                    btns.append([(label, value)])            # one time per row (full label fits)
                 telegram.send_message(chat_id, header, buttons=btns)
 
             return telegram.send_message(
