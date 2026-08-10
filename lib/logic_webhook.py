@@ -15,7 +15,7 @@ import sys
 import json
 
 
-from lib import store, telegram, vox, scene, cronjob  # noqa: E402
+from lib import store, telegram, vox, scene, scene_seats, cronjob  # noqa: E402
 
 JOIN_CODE = os.getenv("JOIN_CODE", "").strip()
 
@@ -147,6 +147,9 @@ def handle_callback(chat_id, data):
     if action == "show":                       # show:<chain>:<slug>
         return show_showtimes(chat_id, parts[1], parts[2])
 
+    if action == "seatmap":                    # seatmap:<showtimeId> (Scene, read-only)
+        return show_seatmap(chat_id, parts[1])
+
     if action == "mark":                       # mark:<chain>:<slug> -> ask cinema
         store.set_convo(chat_id, {"chain": parts[1], "slug": parts[2],
                                   "step": "cinema"})
@@ -174,6 +177,29 @@ def handle_callback(chat_id, data):
         return save_watch(chat_id, parts[1])
 
 
+def _send_movie_card(chat_id, m):
+    """Poster + details caption + trailer button."""
+    bits = []
+    if m.get("rating"): bits.append(m["rating"])
+    if m.get("genre"): bits.append(m["genre"])
+    if m.get("runtime"): bits.append(f"{m['runtime']} min")
+    meta = " · ".join(bits)
+    lang = ""
+    if m.get("language"):
+        lang = f"\n🗣 {m['language']}"
+        if m.get("subtitles"): lang += f" · sub {m['subtitles']}"
+    caption = f"🎬 <b>{m['title']}</b>"
+    if meta: caption += f"\n{meta}"
+    caption += lang
+    buttons = None
+    if m.get("trailerUrl"):
+        buttons = [[("▶️ Trailer", m["trailerUrl"])]]
+    try:
+        telegram.send_photo(chat_id, m["posterUrl"], caption=caption, buttons=buttons)
+    except Exception:
+        telegram.send_message(chat_id, caption, buttons=buttons)
+
+
 def _seat_label(seats):
     """Human seat-availability label shown under each showtime."""
     if seats is None:
@@ -195,8 +221,12 @@ def show_showtimes(chat_id, chain, slug):
             # include sold-out too (only_available=False) so we can SHOW them as booked
             sess = vox.sessions_for(b, movie_slug=slug, time_filter="any",
                                     only_available=False)
-            title = vox.find_movie(b, slug=slug)
-            name = title["title"] if title else slug.replace("-", " ").title()
+            movie = vox.find_movie(b, slug=slug)
+            name = movie["title"] if movie else slug.replace("-", " ").title()
+
+            # rich movie card (poster + details + trailer) before showtimes
+            if movie and movie.get("posterUrl"):
+                _send_movie_card(chat_id, movie)
 
             if not sess:
                 # movie exists but no sessions at all
@@ -257,12 +287,16 @@ def show_showtimes(chat_id, chain, slug):
                     chat_id, f"🎬 <b>{name}</b> — {days[0]}: no showtimes listed.")
             lines = [f"🎬 <b>{name}</b> — Scene CFC · {days[0]}", ""]
             rows = []
-            for x in sess[:12]:
+            for x in sess[:8]:
                 lines.append(f"   • {x['time']} · {x['experience']}")
-                rows.append([(f"Book {x['time']} · {x['experience'][:6]}",
-                              x["showtime_url"])])
-            lines.append("\nTap to book on Scene, or watch for a date that "
-                         "isn't open yet.")
+                # showtime id is the tail of the showtime_url (…/showtime-<id>)
+                stid = x["showtime_url"].rstrip("/").split("-")[-1]
+                rows.append([
+                    (f"🗺 Seats {x['time']}", f"seatmap:{stid}"),
+                    (f"Book {x['time'][:5]}", x["showtime_url"]),
+                ])
+            lines.append("\nTap 🗺 to see the seat map, or Book to go to Scene. "
+                         "You can also watch for a date that isn't open yet.")
             rows.append([("⏰ Watch for another date", f"mark:scene:{slug}")])
             return telegram.send_message(chat_id, "\n".join(lines), buttons=rows)
     except Exception as e:
@@ -316,6 +350,19 @@ def _dates_already_open(chain, slug, cinemas, dates):
     except Exception:
         pass          # if the check fails, fall through and just set the watch
     return open_now
+
+
+def show_seatmap(chat_id, showtime_id):
+    """Scene only: fetch + render the live seat map (read-only, holds nothing)."""
+    telegram.send_message(chat_id, "Loading seat map…")
+    try:
+        plan = scene_seats.fetch_seat_plan(showtime_id)
+        if not plan:
+            return telegram.send_message(chat_id,
+                "Couldn't load the seat map for that showtime.")
+        telegram.send_message(chat_id, scene_seats.render_text(plan))
+    except Exception as e:
+        telegram.send_message(chat_id, f"Seat map unavailable: {e}")
 
 
 def save_watch(chat_id, date_choice):
