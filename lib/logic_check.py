@@ -584,12 +584,10 @@ def run_sweep():
                 "seenSessions"
             )
 
-            # Legacy watches created before seenSessions existed must be
-            # bootstrapped from the CURRENT matching sessions. Otherwise the
-            # first cron run would incorrectly alert for every showtime that
-            # was already open before the watcher existed.
-            legacy_snapshot = old_seen is None
-            old_seen = set(old_seen or [])
+            if old_seen is None:
+                old_seen = []
+
+            old_seen = set(old_seen)
 
             # ---------------------------------------------------------------
             # Find ONLY newly appearing matching sessions.
@@ -617,7 +615,7 @@ def run_sweep():
 
                 current_keys.add(key)
 
-                if not legacy_snapshot and key not in old_seen:
+                if key not in old_seen:
                     new_sessions.append(
                         session
                     )
