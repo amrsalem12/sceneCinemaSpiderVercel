@@ -131,3 +131,35 @@ def set_convo(chat_id, state):
 
 def clear_convo(chat_id):
     _set(f"convo:{chat_id}", {})
+
+
+# ---------- Telegram callback idempotency ----------
+def claim_callback(callback_id, ttl=300):
+    """
+    Atomically claim a Telegram callback query for processing.
+
+    Telegram can retry a webhook while the first request is still doing
+    network work. Without a claim, the same date/experience button can be
+    processed twice, creating duplicate watches; the second request then sees
+    the conversation already cleared and reports "Something expired".
+
+    Returns True only for the first request that claims the callback.
+    """
+    key = f"callback:{callback_id}"
+
+    if _kv_available():
+        try:
+            # Redis SET key value NX EX ttl
+            result = _kv("SET", key, "1", "NX", "EX", int(ttl))
+            return result == "OK"
+        except Exception:
+            # If the idempotency guard itself fails, don't block the bot.
+            return True
+
+    # Local fallback: best-effort.
+    d = _local_all()
+    if key in d:
+        return False
+    d[key] = 1
+    _local_save(d)
+    return True
