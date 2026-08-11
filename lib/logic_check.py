@@ -1,27 +1,24 @@
 """
 Cron sweep — the background half of the bot (Mode B).
 
-The watcher checks each active watch and alerts only when a genuinely
-NEW matching showtime appears.
+Pinged on a schedule by cron-job.org (only while enabled). Each run:
+  1. Loop every user's active watches (both chains).
+  2. For each, check if the watched movie has NEW bookable showtimes
+     matching ALL of the user's filters:
+       - cinema
+       - experience
+       - date
+       - time filter
+  3. Existing showtimes that were already present when the watch was created
+     are ignored.
+  4. If a NEW matching showtime appears -> LOUD repeated alert with book
+     buttons; keep alerting each run until the user sends /booked or /remove.
+  5. Send each user a QUIET hourly status ("still watching …") so they know
+     the watcher is alive — gated by a stored timestamp so a fast cron
+     doesn't spam.
+  6. If no user has any active watch left -> auto-disable the cron.
 
-Important watcher behavior:
-
-1. A date becoming open for the first time is NOT an alert.
-   Its currently published showtimes become the baseline.
-
-2. A showtime added later to an already-open date IS an alert.
-
-3. Experience/theatre filters are respected:
-      IMAX + Gold + Standard
-   means any of those three experiences can trigger the watch.
-
-4. Existing watches created before the experience/date-baseline fields
-   were introduced are migrated safely on their first sweep.
-
-5. Once a watch has triggered, loud alerts continue on later cron runs
-   until /booked or /remove, preserving the existing behavior.
-
-6. VOX seats are availability flags, not counts.
+Returns JSON summary (also handy for manual GET tests / heartbeat).
 """
 
 import os
@@ -34,747 +31,324 @@ from datetime import datetime, timedelta
 from lib import store, telegram, vox, scene, cronjob  # noqa: E402
 
 
-ALERT_REPEAT = int(
-    os.getenv(
-        "ALERT_REPEAT",
-        "5",
-    )
-)
-
-ALERT_INTERVAL = int(
-    os.getenv(
-        "ALERT_INTERVAL",
-        "3",
-    )
-)
-
-TZ_OFFSET = int(
-    os.getenv(
-        "TZ_OFFSET",
-        "3",
-    )
-)
-
-STATUS_EVERY = int(
-    os.getenv(
-        "STATUS_EVERY_SEC",
-        "3600",
-    )
-)
+ALERT_REPEAT = int(os.getenv("ALERT_REPEAT", "5"))
+ALERT_INTERVAL = int(os.getenv("ALERT_INTERVAL", "3"))
+TZ_OFFSET = int(os.getenv("TZ_OFFSET", "3"))               # Cairo
+STATUS_EVERY = int(os.getenv("STATUS_EVERY_SEC", "3600"))  # hourly status ping
 
 
 def _local_now():
-    return (
-        datetime.utcnow()
-        + timedelta(
-            hours=TZ_OFFSET
-        )
-    )
+    return datetime.utcnow() + timedelta(hours=TZ_OFFSET)
 
 
-# -------------------------------------------------------------------
-# Generic helpers
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Experience matching
+# ---------------------------------------------------------------------------
 
-def _experience_matches(session, experiences):
+def _normalize_experience(value):
     """
-    Empty experiences = any experience.
+    Normalize experience names/codes so old/new watcher data can be compared.
 
-    Otherwise the session must have one of the selected experiences.
+    VOX:
+      imx -> IMAX
+      gd  -> Gold
+      mx  -> MAX
+      fx  -> 4DX
+      kd  -> Kids
+      st  -> Standard
+
+    Scene:
+      imax -> ScreenX
+      vip  -> Premiere
+      stand -> Standard
     """
-    if not experiences:
+    if value is None:
+        return "any"
+
+    s = str(value).strip().lower()
+
+    aliases = {
+        "any": "any",
+
+        # VOX
+        "imx": "imax",
+        "imax": "imax",
+        "gd": "gold",
+        "gold": "gold",
+        "mx": "max",
+        "max": "max",
+        "fx": "4dx",
+        "4dx": "4dx",
+        "kd": "kids",
+        "kids": "kids",
+        "st": "standard",
+        "standard": "standard",
+
+        # Scene
+        "screenx": "screenx",
+        "premiere": "premiere",
+        "vip": "premiere",
+        "stand": "standard",
+    }
+
+    return aliases.get(s, s)
+
+
+def _experience_matches(session_experience, wanted_experience):
+    """
+    True only when the session has the experience requested by the watch.
+
+    A missing/old watch experience means "any experience" for backwards
+    compatibility.
+    """
+    wanted = _normalize_experience(wanted_experience)
+
+    if wanted == "any":
         return True
 
-    return (
-        session.get("experience")
-        in set(experiences)
-    )
+    actual = _normalize_experience(session_experience)
 
+    return actual == wanted
+
+
+# ---------------------------------------------------------------------------
+# Session identity / new-session detection
+# ---------------------------------------------------------------------------
 
 def _session_key(chain, session):
     """
-    Stable identity of a showtime.
+    Stable identifier for a showtime.
 
-    We intentionally do NOT include seats/availability in this key.
-    A seat availability change is not a new showtime.
+    VOX session ids are preferred. Booking URL is the fallback.
+
+    Scene uses the showtime URL.
     """
     if chain == "vox":
-        return (
-            f"vox:{session.get('id') or session.get('bookingUrl')}"
-        )
+        return f"vox:{session.get('id') or session.get('bookingUrl')}"
 
-    return (
-        f"scene:{session.get('showtime_url')}"
-    )
+    return f"scene:{session.get('showtime_url')}"
 
 
-def _session_is_available(chain, session):
+def _get_seen_sessions(watch):
     """
-    Whether this showtime is currently bookable.
+    Return the watcher snapshot as a set.
 
-    VOX:
-      seats is a binary available/sold-out flag.
-
-    Scene:
-      sessions returned by Scene are considered bookable here;
-      the actual seat map is separate and read-only.
+    Older watches created before seenSessions existed are treated as having
+    an empty snapshot. New watches created by the corrected webhook always
+    have this field populated.
     """
-    if chain == "vox":
-        return bool(
-            session.get("seats")
-        )
+    raw = watch.get("seenSessions", [])
 
-    return True
+    if not isinstance(raw, list):
+        return set()
+
+    return set(str(x) for x in raw)
 
 
-def _date_from_session(session):
+# ---------------------------------------------------------------------------
+# Watch matching
+# ---------------------------------------------------------------------------
+
+def check_watch(bundle_cache, watch):
     """
-    Return a normalized YYYYMMDD date for a VOX session.
+    Return a list of (label, bookingUrl) tuples if the watch has NEW matching
+    showtimes now.
 
-    Scene dates are handled separately because Scene's session
-    objects do not expose the same displayDate field.
-    """
-    value = session.get(
-        "displayDate"
-    )
+    A showtime must satisfy ALL of:
+      - movie
+      - selected cinema
+      - selected experience
+      - selected date(s)
+      - selected time filter
+      - available seats
+      - NOT already present in seenSessions when the watch was created
 
-    if value is None:
-        return None
-
-    try:
-        return int(value)
-    except Exception:
-        return None
-
-
-def _save_watchlist(chat_id, wl):
-    """
-    Persist a modified watchlist.
-
-    store.py intentionally exposes the generic _set used elsewhere
-    by this project, so use the same storage layer rather than
-    introducing another persistence API.
-    """
-    store._set(
-        f"watchlist:{chat_id}",
-        wl,
-    )
-
-
-# -------------------------------------------------------------------
-# VOX / Scene session collection
-# -------------------------------------------------------------------
-
-def _vox_sessions(
-    bundle,
-    watch,
-):
-    """
-    Return ALL VOX sessions matching:
-      movie
-      cinema
-      date
-      time filter
-
-    Experience filtering happens afterward.
-    Availability filtering also happens afterward.
-
-    This is important because the watcher needs the complete
-    published session set to establish a baseline.
+    bundle_cache: dict to memoize the VOX bundle within one run.
     """
 
+    chain = watch["chain"]
     slug = watch["movieSlug"]
 
-    cinemas = watch.get(
-        "cinemas",
-        "any",
-    )
+    cinemas = watch.get("cinemas", "any")
+    tf = watch.get("timeFilter", "any")
+    wanted_experience = watch.get("experience", "any")
 
-    tf = watch.get(
-        "timeFilter",
-        "any",
-    )
+    # date filter:
+    # "any", a single YYYYMMDD int, or a list of YYYYMMDD ints
+    want_date = watch.get("date", "any")
 
-    want_date = watch.get(
-        "date",
-        "any",
-    )
+    date_set = None
 
-    if want_date == "any":
-        return vox.sessions_for(
-            bundle,
-            movie_slug=slug,
-            cinemas=cinemas,
-            time_filter=tf,
-            only_available=False,
+    if want_date != "any":
+        date_set = (
+            set(want_date)
+            if isinstance(want_date, list)
+            else {want_date}
         )
 
-    dates = (
-        want_date
-        if isinstance(want_date, list)
-        else [want_date]
-    )
+    seen = _get_seen_sessions(watch)
 
-    out = []
+    # -----------------------------------------------------------------------
+    # VOX
+    # -----------------------------------------------------------------------
 
-    for d in dates:
-        out.extend(
-            vox.sessions_for(
-                bundle,
+    if chain == "vox":
+
+        b = bundle_cache.get("vox")
+
+        if b is None:
+            b = bundle_cache["vox"] = vox.fetch_bundle()
+
+        if date_set:
+
+            sess = []
+
+            for d in date_set:
+                sess += vox.sessions_for(
+                    b,
+                    movie_slug=slug,
+                    cinemas=cinemas,
+                    display_date=d,
+                    time_filter=tf,
+                    only_available=True,
+                )
+
+        else:
+
+            sess = vox.sessions_for(
+                b,
                 movie_slug=slug,
                 cinemas=cinemas,
-                display_date=d,
                 time_filter=tf,
-                only_available=False,
+                only_available=True,
             )
-        )
 
-    return out
+        # IMPORTANT:
+        # Filter experience AFTER retrieving sessions.
+        #
+        # This is the bug that caused:
+        #
+        #   User wanted IMAX
+        #   Gold/Standard opened
+        #   watcher said OPEN
+        #
+        # We now require the exact requested experience.
+        sess = [
+            s for s in sess
+            if _experience_matches(
+                s.get("experience"),
+                wanted_experience,
+            )
+        ]
 
+        # Only NEW sessions should trigger the watcher.
+        new_sess = [
+            s for s in sess
+            if _session_key("vox", s) not in seen
+        ]
 
-def _scene_open_dates(watch):
-    """
-    Return the Scene dates that are currently open for this watch.
+        return [
+            (
+                f"{s['cinema'][:16]} · "
+                f"{s['experience']} · "
+                f"{s['time']}",
+                s["bookingUrl"],
+            )
+            for s in new_sess[:10]
+        ]
 
-    Date values are normalized to YYYYMMDD integers.
-    """
-    slug = watch["movieSlug"]
+    # -----------------------------------------------------------------------
+    # Scene
+    # -----------------------------------------------------------------------
 
-    open_days = sorted(
-        scene.open_days(slug)
-    )
+    # Scene's open_days() only tells us that SOME experience has opened.
+    #
+    # That is NOT sufficient for a watcher.
+    #
+    # We therefore inspect the actual sessions and apply the exact same
+    # experience filtering used by VOX.
 
-    want_date = watch.get(
-        "date",
-        "any",
-    )
+    if not scene.is_bookable(slug):
+        return []
 
-    if want_date == "any":
-        wanted = None
+    open_days = sorted(scene.open_days(slug))
+
+    if not open_days:
+        return []
+
+    if date_set:
+
+        want_ddmm = {
+            scene.to_ddmmyyyy(d)
+            for d in date_set
+        }
+
+        target_days = [
+            d for d in open_days
+            if d in want_ddmm
+        ]
+
+        if not target_days:
+            return []
 
     else:
-        wanted = set(
-            want_date
-            if isinstance(want_date, list)
-            else [want_date]
+        target_days = open_days
+
+    hits = []
+
+    for d in target_days:
+
+        sessions = scene.sessions_for(
+            slug,
+            d,
+            time_filter=tf,
         )
 
-    out = []
-
-    for ddmm in open_days:
-        try:
-            dd, mm, yyyy = ddmm.split("-")
-            ymd = int(
-                f"{yyyy}{mm}{dd}"
+        # EXACT experience filtering.
+        sessions = [
+            x for x in sessions
+            if _experience_matches(
+                x.get("experience"),
+                wanted_experience,
             )
-        except Exception:
-            continue
-
-        if wanted is None or ymd in wanted:
-            out.append(
-                (ymd, ddmm)
-            )
-
-    return out
-
-
-def _scene_sessions_for_date(
-    watch,
-    ddmm,
-):
-    """
-    Return all Scene sessions for one open date.
-    """
-    return scene.sessions_for(
-        watch["movieSlug"],
-        ddmm,
-        time_filter=watch.get(
-            "timeFilter",
-            "any",
-        ),
-    )
-
-
-# -------------------------------------------------------------------
-# Date/session state
-# -------------------------------------------------------------------
-
-def _watch_date_targets(
-    bundle_cache,
-    watch,
-):
-    """
-    Return:
-
-      {
-        date_key: {
-          "sessions": [...],
-          "open": True
-        }
-      }
-
-    Only dates currently open/published are returned.
-
-    For VOX, a date is considered open when VOX has sessions.
-
-    For Scene, the calendar strip is authoritative for whether the
-    date itself is open.
-    """
-
-    chain = watch["chain"]
-
-    result = {}
-
-    if chain == "vox":
-        bundle = bundle_cache.get(
-            "vox"
-        )
-
-        if bundle is None:
-            bundle = vox.fetch_bundle()
-            bundle_cache["vox"] = bundle
-
-        sessions = _vox_sessions(
-            bundle,
-            watch,
-        )
-
-        for session in sessions:
-            d = _date_from_session(
-                session
-            )
-
-            if d is None:
-                continue
-
-            result.setdefault(
-                d,
-                [],
-            ).append(session)
-
-        return result
-
-    # Scene
-    for ymd, ddmm in _scene_open_dates(
-        watch
-    ):
-        try:
-            sessions = _scene_sessions_for_date(
-                watch,
-                ddmm,
-            )
-        except Exception:
-            sessions = []
-
-        result[ymd] = sessions
-
-    return result
-
-
-def _matching_sessions(
-    chain,
-    sessions,
-    experiences,
-):
-    """
-    Apply experience filter to sessions.
-    """
-    return [
-        s
-        for s in sessions
-        if _experience_matches(
-            s,
-            experiences,
-        )
-    ]
-
-
-def _available_matching_sessions(
-    chain,
-    sessions,
-    experiences,
-):
-    """
-    Apply BOTH:
-      experience filter
-      availability filter
-    """
-    return [
-        s
-        for s in sessions
-        if _experience_matches(
-            s,
-            experiences,
-        )
-        and _session_is_available(
-            chain,
-            s,
-        )
-    ]
-
-
-# -------------------------------------------------------------------
-# Core watcher
-# -------------------------------------------------------------------
-
-def check_watch(
-    bundle_cache,
-    watch,
-):
-    """
-    Check one watch.
-
-    Returns:
-      (hits, state_changed)
-
-    hits:
-      currently bookable matching sessions that should be included
-      in a loud alert.
-
-    state_changed:
-      whether seenSessions / initializedDates / alertedSessions
-      were changed and therefore need to be persisted.
-    """
-
-    chain = watch["chain"]
-
-    experiences = list(
-        watch.get(
-            "experiences",
-            [],
-        )
-    )
-
-    # ----------------------------------------------------------------
-    # Migration for old watches
-    # ----------------------------------------------------------------
-
-    seen_sessions = set(
-        watch.get(
-            "seenSessions",
-            [],
-        )
-    )
-
-    initialized_dates = set(
-        str(x)
-        for x in watch.get(
-            "initializedDates",
-            [],
-        )
-    )
-
-    alerted_sessions = set(
-        watch.get(
-            "alertedSessions",
-            [],
-        )
-    )
-
-    state_changed = False
-
-    # ----------------------------------------------------------------
-    # Get currently open dates + all sessions
-    # ----------------------------------------------------------------
-
-    date_targets = _watch_date_targets(
-        bundle_cache,
-        watch,
-    )
-
-    # No open date currently.
-    if not date_targets:
-        return [], state_changed
-
-    new_session_hits = []
-
-    # ----------------------------------------------------------------
-    # Process each open date independently.
-    #
-    # This is the key fix for the "date just opened" bug.
-    # ----------------------------------------------------------------
-
-    for date_key, all_sessions in date_targets.items():
-
-        date_key = str(
-            date_key
-        )
-
-        current_keys = {
-            _session_key(
-                chain,
-                s,
-            )
-            for s in all_sessions
-        }
-
-        # ------------------------------------------------------------
-        # First time this date has ever been observed by this watch.
-        #
-        # IMPORTANT:
-        # Do NOT alert.
-        #
-        # Everything currently published on this date becomes
-        # baseline, regardless of experience selection.
-        # ------------------------------------------------------------
-
-        if date_key not in initialized_dates:
-            initialized_dates.add(
-                date_key
-            )
-
-            before = len(
-                seen_sessions
-            )
-
-            seen_sessions.update(
-                current_keys
-            )
-
-            if (
-                len(seen_sessions)
-                != before
-            ):
-                state_changed = True
-
-            state_changed = True
-
-            # Do not alert for anything on this first observation.
-            continue
-
-        # ------------------------------------------------------------
-        # Date has already been initialized.
-        #
-        # Now detect genuinely NEW showtimes.
-        # ------------------------------------------------------------
-
-        for session in all_sessions:
-            key = _session_key(
-                chain,
-                session,
-            )
-
-            if key in seen_sessions:
-                continue
-
-            # It is a genuinely new showtime.
-            seen_sessions.add(
-                key
-            )
-
-            state_changed = True
-
-            # It must also satisfy the selected experience.
-            if not _experience_matches(
-                session,
-                experiences,
-            ):
-                continue
-
-            # It must currently be bookable.
-            if not _session_is_available(
-                chain,
-                session,
-            ):
-                continue
-
-            new_session_hits.append(
-                session
-            )
-
-    # ----------------------------------------------------------------
-    # Persist the complete current session set.
-    #
-    # This also makes the state resilient if a session disappears
-    # temporarily from a cinema feed.
-    # ----------------------------------------------------------------
-
-    all_current_keys = set()
-
-    for sessions in date_targets.values():
-        all_current_keys.update(
-            _session_key(
-                chain,
-                s,
-            )
-            for s in sessions
-        )
-
-    before_count = len(
-        seen_sessions
-    )
-
-    seen_sessions.update(
-        all_current_keys
-    )
-
-    if len(seen_sessions) != before_count:
-        state_changed = True
-
-    # ----------------------------------------------------------------
-    # Save state back into the watch object.
-    # ----------------------------------------------------------------
-
-    watch["seenSessions"] = list(
-        seen_sessions
-    )
-
-    watch["initializedDates"] = list(
-        initialized_dates
-    )
-
-    # ----------------------------------------------------------------
-    # New session(s) found.
-    #
-    # Store them as alert-triggering sessions.
-    # ----------------------------------------------------------------
-
-    if new_session_hits:
-        for session in new_session_hits:
-            alerted_sessions.add(
-                _session_key(
-                    chain,
-                    session,
+        ]
+
+        # Only sessions that did not exist when the watch was created.
+        sessions = [
+            x for x in sessions
+            if _session_key("scene", x) not in seen
+        ]
+
+        for x in sessions:
+
+            hits.append(
+                (
+                    f"{x['experience']} · "
+                    f"{x['time']} ({d})",
+                    x["showtime_url"],
                 )
             )
 
-        state_changed = True
-
-    watch["alertedSessions"] = list(
-        alerted_sessions
-    )
-
-    # ----------------------------------------------------------------
-    # Repeated alert behavior.
-    #
-    # Once a genuinely new matching showtime has triggered the watch,
-    # keep sending loud alerts until the watch is removed/booked.
-    #
-    # We intentionally do NOT use the old "alerted" boolean as the
-    # trigger because old watches may have been falsely alerted by the
-    # previous buggy logic.
-    # ----------------------------------------------------------------
-
-    should_repeat = bool(
-        alerted_sessions
-    )
-
-    if not should_repeat:
-        return [], state_changed
-
-    # Current matching/bookable sessions for the alert buttons.
-    current_hits = []
-
-    for sessions in date_targets.values():
-        current_hits.extend(
-            _available_matching_sessions(
-                chain,
-                sessions,
-                experiences,
-            )
-        )
-
-    # Deduplicate by showtime key.
-    unique = []
-    seen_hit_keys = set()
-
-    for session in current_hits:
-        key = _session_key(
-            chain,
-            session,
-        )
-
-        if key in seen_hit_keys:
-            continue
-
-        seen_hit_keys.add(
-            key
-        )
-
-        unique.append(
-            session
-        )
-
-    # If the watch triggered before but all current sessions are gone,
-    # don't send an empty alert.
-    if not unique:
-        return [], state_changed
-
-    return unique, state_changed
+    return hits[:10]
 
 
-# -------------------------------------------------------------------
-# Formatting
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Status message
+# ---------------------------------------------------------------------------
 
-def _session_label(chain, session):
-    """
-    Convert a session to the label used in Telegram alert buttons.
-    """
-
-    if chain == "vox":
-        cinema = session.get(
-            "cinema",
-            "VOX",
-        )
-
-        experience = session.get(
-            "experience",
-            "Standard",
-        )
-
-        time = session.get(
-            "time",
-            "",
-        )
-
-        return (
-            f"{cinema[:16]} · "
-            f"{experience} · "
-            f"{time}"
-        )
-
-    experience = session.get(
-        "experience",
-        "Standard",
-    )
-
-    time = session.get(
-        "time",
-        "",
-    )
-
-    return (
-        f"{experience} · "
-        f"{time}"
-    )
-
-
-def _watch_summary(
-    wl,
-    open_ids,
-):
-    """
-    Build the quiet hourly 'still watching' status text.
-    """
+def _watch_summary(wl, open_ids):
+    """Build the quiet hourly 'still watching' status text."""
 
     lines = [
         "👀 <b>Still watching</b> — hourly update"
     ]
 
-    for i, w in enumerate(
-        wl,
-        1,
-    ):
+    for i, w in enumerate(wl, 1):
+
         cine = (
             "any"
-            if w.get("cinemas") == "any"
-            else ",".join(
-                w.get(
-                    "cinemas",
-                    [],
-                )
-            )
+            if w["cinemas"] == "any"
+            else ",".join(w["cinemas"])
         )
 
         dlabel = w.get(
@@ -782,17 +356,9 @@ def _watch_summary(
             "any date",
         )
 
-        experiences = w.get(
-            "experiences",
-            [],
-        )
-
-        experience_label = (
-            "any"
-            if not experiences
-            else " / ".join(
-                experiences
-            )
+        experience = w.get(
+            "experienceLabel",
+            w.get("experience", "any"),
         )
 
         flag = (
@@ -803,10 +369,11 @@ def _watch_summary(
 
         lines.append(
             f"{i}. {w['movieTitle']} "
-            f"[{w['chain']}] @ {cine} "
-            f"· {experience_label} "
+            f"[{w['chain']}] "
+            f"@ {cine} "
+            f"· {experience} "
             f"· {dlabel} "
-            f"· {w.get('timeFilter', 'any')}"
+            f"· {w['timeFilter']}"
             f"{flag}"
         )
 
@@ -815,23 +382,21 @@ def _watch_summary(
         "/booked &lt;n&gt; or /remove &lt;n&gt; to stop."
     )
 
-    return "\n".join(
-        lines
-    )
+    return "\n".join(lines)
 
 
-# -------------------------------------------------------------------
-# Hourly status
-# -------------------------------------------------------------------
-
-def _maybe_send_status(
-    chat_id,
-    wl,
-    open_ids,
-    summary,
-):
+def _maybe_send_status(chat_id, wl, open_ids, summary):
     """
     Send the status at most once per the user's chosen interval.
+
+    Interval set from Telegram via /status
+    (key status_interval:<chat_id>):
+      seconds
+      0 = off
+      unset = STATUS_EVERY default
+
+    Records why it did/didn't send into summary['status_debug'] so
+    /api/check reveals the gate state.
     """
 
     iv = store._get(
@@ -856,10 +421,7 @@ def _maybe_send_status(
             or 0
         )
 
-    except (
-        TypeError,
-        ValueError,
-    ):
+    except (TypeError, ValueError):
         last = 0
 
     since = round(
@@ -873,14 +435,17 @@ def _maybe_send_status(
     }
 
     if iv <= 0:
+
         dbg["decision"] = "off"
 
     elif since < iv - 60:
+
         dbg["decision"] = (
             f"wait {iv - 60 - since}s"
         )
 
     else:
+
         res = telegram.send_message(
             chat_id,
             _watch_summary(
@@ -896,6 +461,7 @@ def _maybe_send_status(
         )
 
         if ok:
+
             store._set(
                 f"status_ts:{chat_id}",
                 now_ts,
@@ -904,6 +470,7 @@ def _maybe_send_status(
             dbg["decision"] = "SENT"
 
         else:
+
             dbg["decision"] = (
                 f"send_failed: {res}"
             )
@@ -911,9 +478,7 @@ def _maybe_send_status(
     summary.setdefault(
         "status_debug",
         [],
-    ).append(
-        dbg
-    )
+    ).append(dbg)
 
     return (
         dbg.get("decision")
@@ -921,11 +486,12 @@ def _maybe_send_status(
     )
 
 
-# -------------------------------------------------------------------
-# Main sweep
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Sweep
+# ---------------------------------------------------------------------------
 
 def run_sweep():
+
     summary = {
         "checked": 0,
         "alerts": 0,
@@ -951,86 +517,74 @@ def run_sweep():
 
         open_ids = set()
 
-        watchlist_changed = False
-
         for w in wl:
+
             any_active = True
 
             summary["checked"] += 1
 
             try:
-                hits, changed = check_watch(
+
+                hits = check_watch(
                     bundle_cache,
                     w,
                 )
 
-                if changed:
-                    watchlist_changed = True
-
             except Exception as e:
+
                 summary["errors"].append(
                     f"{w.get('movieSlug')}: {e}"
                 )
 
                 continue
 
-            if not hits:
-                continue
+            if hits:
 
-            # --------------------------------------------------------
-            # Loud repeated alert.
-            # --------------------------------------------------------
+                # OPEN -> loud alert.
+                #
+                # Deliberately do NOT clear the watch and do NOT mark the
+                # sessions as seen here. The user asked for repeated alerts
+                # until /booked or /remove.
 
-            title = w[
-                "movieTitle"
-            ]
+                title = w["movieTitle"]
 
-            buttons = [
-                [
-                    (
-                        _session_label(
-                            w["chain"],
-                            h,
-                        ),
-                        (
-                            h["bookingUrl"]
-                            if w["chain"] == "vox"
-                            else h["showtime_url"]
-                        ),
-                    )
+                buttons = [
+                    [h]
+                    for h in hits
                 ]
-                for h in hits
-            ]
 
-            telegram.alert_burst(
-                chat_id,
-                f"🎬🔔 <b>{title}</b> has new "
-                f"matching showtimes!\n"
-                f"Tap a showtime to book:",
-                buttons=buttons,
-                repeat=ALERT_REPEAT,
-                interval=ALERT_INTERVAL,
-            )
+                experience = w.get(
+                    "experienceLabel",
+                    w.get("experience", "any"),
+                )
 
-            # Keep the existing /list OPEN indicator.
-            w["alerted"] = True
+                telegram.alert_burst(
+                    chat_id,
 
-            watchlist_changed = True
+                    f"🎬🔔 <b>{title}</b> "
+                    f"is OPEN for booking!\n"
+                    f"Experience: <b>{experience}</b>\n"
+                    f"Tap a showtime to book on the cinema site:",
 
-            open_ids.add(
-                w["id"]
-            )
+                    buttons=buttons,
 
-            summary["alerts"] += 1
+                    repeat=ALERT_REPEAT,
+                    interval=ALERT_INTERVAL,
+                )
 
-        # Persist watcher state changes.
-        if watchlist_changed:
-            _save_watchlist(
-                chat_id,
-                wl,
-            )
+                store.set_alerted(
+                    chat_id,
+                    w["id"],
+                    True,
+                )
 
-        # Quiet hourly heartbeat.
+                open_ids.add(
+                    w["id"]
+                )
+
+                summary["alerts"] += 1
+
+        # quiet hourly heartbeat
         if _maybe_send_status(
             chat_id,
             wl,
@@ -1039,11 +593,9 @@ def run_sweep():
         ):
             summary["status_sent"] += 1
 
-    # ---------------------------------------------------------------
-    # Auto-disable cron if there are no active watches anywhere.
-    # ---------------------------------------------------------------
-
+    # auto-disable cron if nothing left to watch anywhere
     if not any_active:
+
         last = store._get(
             "cron_state",
             None,
@@ -1055,6 +607,7 @@ def run_sweep():
         )
 
         if res.get("changed"):
+
             store._set(
                 "cron_state",
                 res["state"],
@@ -1065,6 +618,7 @@ def run_sweep():
         )
 
     else:
+
         summary["cron"] = "active"
 
     return summary
