@@ -24,6 +24,10 @@ from lib import store, telegram, vox, scene, scene_seats, cronjob  # noqa: E402
 JOIN_CODE = os.getenv("JOIN_CODE", "").strip()
 
 
+# ---------------------------------------------------------------------------
+# Choices
+# ---------------------------------------------------------------------------
+
 CINEMA_CHOICES = [
     ("VOX Almaza", "vox:000047"),
     ("Scene CFC", "scene:cfc"),
@@ -31,24 +35,54 @@ CINEMA_CHOICES = [
 ]
 
 
-# Experience/theatre choices.
+# Experience choices.
 #
-# The user can select multiple choices. They are treated as OR:
-# selecting IMAX + Gold + Standard means any of those experiences
-# can satisfy the watcher.
+# The stored value is normalized by logic_check.py.
+#
+# VOX:
+#   imx = IMAX
+#   gd  = Gold
+#   mx  = MAX
+#   fx  = 4DX
+#   kd  = Kids
+#   st  = Standard
+#
+# Scene:
+#   imax  = ScreenX
+#   vip   = Premiere
+#   stand = Standard
+#
+# "any" works on both chains.
+
 VOX_EXPERIENCE_CHOICES = [
-    ("Standard", "Standard"),
-    ("Gold", "Gold"),
-    ("IMAX", "IMAX"),
-    ("MAX", "MAX"),
-    ("4DX", "4DX"),
-    ("Kids", "Kids"),
+    ("Any experience", "any"),
+    ("IMAX", "imax"),
+    ("Gold", "gold"),
+    ("MAX", "max"),
+    ("4DX", "4dx"),
+    ("Kids", "kids"),
+    ("Standard", "standard"),
 ]
 
+
 SCENE_EXPERIENCE_CHOICES = [
-    ("Standard", "Standard"),
-    ("Premiere", "Premiere"),
-    ("ScreenX", "ScreenX"),
+    ("Any experience", "any"),
+    ("ScreenX", "screenx"),
+    ("Premiere", "premiere"),
+    ("Standard", "standard"),
+]
+
+
+ANY_EXPERIENCE_CHOICES = [
+    ("Any experience", "any"),
+    ("IMAX", "imax"),
+    ("Gold", "gold"),
+    ("MAX", "max"),
+    ("4DX", "4dx"),
+    ("Kids", "kids"),
+    ("ScreenX", "screenx"),
+    ("Premiere", "premiere"),
+    ("Standard", "standard"),
 ]
 
 
@@ -70,20 +104,101 @@ DATE_CHOICES = [
 ]
 
 
-# ---------------- access control ----------------
+# ---------------------------------------------------------------------------
+# Experience helpers
+# ---------------------------------------------------------------------------
+
+def _experience_label(value):
+    """Human-readable experience label."""
+
+    if value is None:
+        return "Any experience"
+
+    value = str(value).strip().lower()
+
+    labels = {
+        "any": "Any experience",
+
+        "imx": "IMAX",
+        "imax": "IMAX",
+
+        "gd": "Gold",
+        "gold": "Gold",
+
+        "mx": "MAX",
+        "max": "MAX",
+
+        "fx": "4DX",
+        "4dx": "4DX",
+
+        "kd": "Kids",
+        "kids": "Kids",
+
+        "st": "Standard",
+        "standard": "Standard",
+
+        "screenx": "ScreenX",
+
+        "vip": "Premiere",
+        "premiere": "Premiere",
+
+        "stand": "Standard",
+    }
+
+    return labels.get(
+        value,
+        str(value),
+    )
+
+
+def _experience_choices_for(
+    chain,
+    cinema_choice,
+):
+    """
+    Return the experience buttons appropriate for the current selection.
+
+    If a specific chain/cinema is selected, keep the choices clean.
+
+    If the user chose the combined "Any (Almaza or Scene)" option, show the
+    union so they can still request a precise experience. logic_check.py
+    will only match experiences that actually exist on each chain.
+    """
+
+    if cinema_choice.startswith("vox:"):
+        return VOX_EXPERIENCE_CHOICES
+
+    if cinema_choice.startswith("scene:"):
+        return SCENE_EXPERIENCE_CHOICES
+
+    return ANY_EXPERIENCE_CHOICES
+
+
+# ---------------------------------------------------------------------------
+# Access control
+# ---------------------------------------------------------------------------
 
 def is_member(user_id):
     return str(user_id) in set(
-        store._get("allowlist", [])
+        store._get(
+            "allowlist",
+            [],
+        )
     )
 
 
 def add_member(user_id):
+
     ids = set(
-        store._get("allowlist", [])
+        store._get(
+            "allowlist",
+            [],
+        )
     )
 
-    ids.add(str(user_id))
+    ids.add(
+        str(user_id)
+    )
 
     store._set(
         "allowlist",
@@ -91,119 +206,34 @@ def add_member(user_id):
     )
 
 
-# ---------------- experience helpers ----------------
-
-def _experience_choices(chain):
-    """
-    Return the experience choices relevant to the selected chain.
-
-    For an "any" cinema watch, expose the union of VOX + Scene
-    experiences because the watcher can potentially cover both chains.
-    """
-    if chain == "vox":
-        return VOX_EXPERIENCE_CHOICES
-
-    if chain == "scene":
-        return SCENE_EXPERIENCE_CHOICES
-
-    seen = set()
-    out = []
-
-    for name, value in VOX_EXPERIENCE_CHOICES + SCENE_EXPERIENCE_CHOICES:
-        if value not in seen:
-            seen.add(value)
-            out.append((name, value))
-
-    return out
-
-
-def _experience_keyboard(convo):
-    """
-    Build the multi-select experience keyboard.
-
-    convo["experiences"] is:
-      []             -> any experience
-      ["IMAX"]       -> only IMAX
-      ["IMAX","Gold"] -> IMAX OR Gold
-    """
-    selected = set(
-        convo.get("experiences", [])
-    )
-
-    rows = []
-    choices = _experience_choices(
-        convo.get("chain", "any")
-    )
-
-    current_row = []
-
-    for label, value in choices:
-        prefix = "✅ " if value in selected else ""
-        current_row.append(
-            (
-                f"{prefix}{label}",
-                f"me:{value}",
-            )
-        )
-
-        if len(current_row) == 2:
-            rows.append(current_row)
-            current_row = []
-
-    if current_row:
-        rows.append(current_row)
-
-    any_label = (
-        "✅ Any experience"
-        if not selected
-        else "Any experience"
-    )
-
-    rows.append([
-        (
-            any_label,
-            "me:any",
-        )
-    ])
-
-    rows.append([
-        (
-            "➡️ Done",
-            "medone",
-        )
-    ])
-
-    return rows
-
-
-def _experience_label(experiences):
-    """
-    Human-readable experience selection for /list.
-    """
-    if not experiences:
-        return "any experience"
-
-    return " / ".join(experiences)
-
-
-# ---------------- entry point ----------------
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def handle_update(update):
-    ev = telegram.parse_update(update)
+
+    ev = telegram.parse_update(
+        update
+    )
 
     if not ev:
         return
 
-    chat_id, user_id = ev["chat_id"], ev["user_id"]
+    chat_id = ev["chat_id"]
+    user_id = ev["user_id"]
 
     # gate: non-members must send the join code first
     if not is_member(user_id):
+
         if (
             ev["kind"] == "message"
             and JOIN_CODE
             and ev["text"] == JOIN_CODE
         ):
-            add_member(user_id)
+
+            add_member(
+                user_id
+            )
 
             telegram.send_message(
                 chat_id,
@@ -211,6 +241,7 @@ def handle_update(update):
             )
 
         else:
+
             telegram.send_message(
                 chat_id,
                 "🔒 This bot is private. Send the access code to join.",
@@ -219,6 +250,7 @@ def handle_update(update):
         return
 
     if ev["kind"] == "callback":
+
         toast = (
             "Sold out"
             if ev["data"] == "soldout"
@@ -238,6 +270,7 @@ def handle_update(update):
     text = ev["text"]
 
     if text.startswith("/start"):
+
         telegram.send_message(
             chat_id,
             "🎬 Cinema bot.\n\n"
@@ -250,18 +283,23 @@ def handle_update(update):
         )
 
     elif text.startswith("/showing"):
+
         cmd_showing(chat_id)
 
     elif text.startswith("/upcoming"):
+
         cmd_upcoming(chat_id)
 
     elif text.startswith("/list"):
+
         cmd_list(chat_id)
 
     elif text.startswith("/status"):
+
         cmd_status(chat_id)
 
     elif text.startswith("/remove"):
+
         cmd_stop(
             chat_id,
             text,
@@ -269,6 +307,7 @@ def handle_update(update):
         )
 
     elif text.startswith("/booked"):
+
         cmd_stop(
             chat_id,
             text,
@@ -276,15 +315,19 @@ def handle_update(update):
         )
 
     else:
+
         telegram.send_message(
             chat_id,
             "Try /showing or /upcoming.",
         )
 
 
-# ---------------- MODE A: browse now-showing ----------------
+# ---------------------------------------------------------------------------
+# MODE A: browse now-showing
+# ---------------------------------------------------------------------------
 
 def cmd_showing(chat_id):
+
     telegram.send_message(
         chat_id,
         "Fetching what's on…",
@@ -293,9 +336,11 @@ def cmd_showing(chat_id):
     rows = []
 
     try:
+
         b = vox.fetch_bundle()
 
         for m in vox.now_showing(b):
+
             rows.append([
                 (
                     f"🎬 {m['title'][:40]}",
@@ -304,14 +349,17 @@ def cmd_showing(chat_id):
             ])
 
     except Exception as e:
+
         telegram.send_message(
             chat_id,
             f"(VOX unavailable: {e})",
         )
 
-    # Scene now-showing is best-effort.
+    # Scene now-showing is best-effort
     try:
+
         for m in scene.now_showing()[:15]:
+
             rows.append([
                 (
                     f"🎬 {m['title'][:40]} (Scene)",
@@ -323,10 +371,12 @@ def cmd_showing(chat_id):
         pass
 
     if not rows:
+
         telegram.send_message(
             chat_id,
             "Couldn't load movies right now.",
         )
+
         return
 
     telegram.send_message(
@@ -336,9 +386,12 @@ def cmd_showing(chat_id):
     )
 
 
-# ---------------- MODE B: browse coming-soon ----------------
+# ---------------------------------------------------------------------------
+# MODE B: browse coming-soon
+# ---------------------------------------------------------------------------
 
 def cmd_upcoming(chat_id):
+
     telegram.send_message(
         chat_id,
         "Fetching coming soon…",
@@ -347,9 +400,11 @@ def cmd_upcoming(chat_id):
     rows = []
 
     try:
+
         b = vox.fetch_bundle()
 
         for m in vox.coming_soon(b):
+
             rows.append([
                 (
                     f"🔜 {m['title'][:40]}",
@@ -358,13 +413,16 @@ def cmd_upcoming(chat_id):
             ])
 
     except Exception as e:
+
         telegram.send_message(
             chat_id,
             f"(VOX unavailable: {e})",
         )
 
     try:
+
         for m in scene.coming_soon()[:15]:
+
             rows.append([
                 (
                     f"🔜 {m['title'][:40]} (Scene)",
@@ -376,10 +434,12 @@ def cmd_upcoming(chat_id):
         pass
 
     if not rows:
+
         telegram.send_message(
             chat_id,
             "No coming-soon movies found.",
         )
+
         return
 
     telegram.send_message(
@@ -389,14 +449,19 @@ def cmd_upcoming(chat_id):
     )
 
 
-# ---------------- callback router ----------------
+# ---------------------------------------------------------------------------
+# Callback router
+# ---------------------------------------------------------------------------
 
 def handle_callback(chat_id, data):
+
     parts = data.split(":")
     action = parts[0]
 
     if action == "show":
+
         # show:<chain>:<slug> -> day picker
+
         return show_showtimes(
             chat_id,
             parts[1],
@@ -404,7 +469,9 @@ def handle_callback(chat_id, data):
         )
 
     if action == "day":
+
         # day:<chain>:<slug>:<yyyymmdd>
+
         return show_day_showtimes(
             chat_id,
             parts[1],
@@ -413,31 +480,38 @@ def handle_callback(chat_id, data):
         )
 
     if action == "statusiv":
-        # statusiv:<seconds> (0 = off)
+
         return set_status_interval(
             chat_id,
             int(parts[1]),
         )
 
     if action == "seatmap":
-        # seatmap:<showtimeId> (Scene, read-only)
+
         return show_seatmap(
             chat_id,
             ":".join(parts[1:]),
         )
 
     if action == "soldout":
+
         return
 
+    # -----------------------------------------------------------------------
+    # START WATCH
+    # -----------------------------------------------------------------------
+
     if action == "mark":
-        # mark:<chain>:<slug> -> ask cinema
+
+        chain = parts[1]
+        slug = parts[2]
+
         store.set_convo(
             chat_id,
             {
-                "chain": parts[1],
-                "slug": parts[2],
+                "chain": chain,
+                "slug": slug,
                 "step": "cinema",
-                "experiences": [],
             },
         )
 
@@ -446,21 +520,31 @@ def handle_callback(chat_id, data):
             "Which cinema?",
             buttons=[
                 [
-                    (
-                        n,
-                        f"mc:{v}",
-                    )
+                    (name, f"mc:{value}")
                 ]
-                for n, v in CINEMA_CHOICES
+                for name, value
+                in CINEMA_CHOICES
             ],
         )
 
-    if action == "mc":
-        # mc:<chain>:<cinemaId> -> ask experience
-        convo = store.get_convo(chat_id)
+    # -----------------------------------------------------------------------
+    # CINEMA
+    # -----------------------------------------------------------------------
 
-        convo["cinemaChoice"] = ":".join(parts[1:])
-        convo["experiences"] = []
+    if action == "mc":
+
+        convo = store.get_convo(
+            chat_id
+        )
+
+        cinema_choice = ":".join(
+            parts[1:]
+        )
+
+        convo["cinemaChoice"] = (
+            cinema_choice
+        )
+
         convo["step"] = "experience"
 
         store.set_convo(
@@ -468,61 +552,44 @@ def handle_callback(chat_id, data):
             convo,
         )
 
+        choices = _experience_choices_for(
+            convo.get("chain"),
+            cinema_choice,
+        )
+
         return telegram.send_message(
             chat_id,
-            "Which theatre type(s)?\n"
-            "You can select multiple. "
-            "Selected types are treated as OR.",
-            buttons=_experience_keyboard(convo),
+            "Which cinema experience?",
+            buttons=[
+                [
+                    (name, f"me:{value}")
+                ]
+                for name, value
+                in choices
+            ],
         )
+
+    # -----------------------------------------------------------------------
+    # EXPERIENCE
+    # -----------------------------------------------------------------------
 
     if action == "me":
-        # me:<experience>
-        convo = store.get_convo(chat_id)
 
-        if not convo:
-            return telegram.send_message(
-                chat_id,
-                "Something expired — try /upcoming again.",
+        convo = store.get_convo(
+            chat_id
+        )
+
+        experience = parts[1]
+
+        convo["experience"] = (
+            experience
+        )
+
+        convo["experienceLabel"] = (
+            _experience_label(
+                experience
             )
-
-        value = ":".join(parts[1:])
-        selected = list(
-            convo.get("experiences", [])
         )
-
-        if value == "any":
-            selected = []
-
-        elif value in selected:
-            selected.remove(value)
-
-        else:
-            selected.append(value)
-
-        convo["experiences"] = selected
-        convo["step"] = "experience"
-
-        store.set_convo(
-            chat_id,
-            convo,
-        )
-
-        return telegram.send_message(
-            chat_id,
-            "Which theatre type(s)?\n"
-            f"Selected: {_experience_label(selected)}",
-            buttons=_experience_keyboard(convo),
-        )
-
-    if action == "medone":
-        convo = store.get_convo(chat_id)
-
-        if not convo:
-            return telegram.send_message(
-                chat_id,
-                "Something expired — try /upcoming again.",
-            )
 
         convo["step"] = "time"
 
@@ -536,19 +603,27 @@ def handle_callback(chat_id, data):
             "Which showtimes?",
             buttons=[
                 [
-                    (
-                        n,
-                        f"mt:{v}",
-                    )
+                    (name, f"mt:{value}")
                 ]
-                for n, v in TIME_CHOICES
+                for name, value
+                in TIME_CHOICES
             ],
         )
 
-    if action == "mt":
-        convo = store.get_convo(chat_id)
+    # -----------------------------------------------------------------------
+    # TIME
+    # -----------------------------------------------------------------------
 
-        convo["timeFilter"] = parts[1]
+    if action == "mt":
+
+        convo = store.get_convo(
+            chat_id
+        )
+
+        convo["timeFilter"] = (
+            parts[1]
+        )
+
         convo["step"] = "date"
 
         store.set_convo(
@@ -561,16 +636,19 @@ def handle_callback(chat_id, data):
             "Which date?",
             buttons=[
                 [
-                    (
-                        n,
-                        f"md:{v}",
-                    )
+                    (name, f"md:{value}")
                 ]
-                for n, v in DATE_CHOICES
+                for name, value
+                in DATE_CHOICES
             ],
         )
 
+    # -----------------------------------------------------------------------
+    # DATE
+    # -----------------------------------------------------------------------
+
     if action == "md":
+
         return save_watch(
             chat_id,
             parts[1],
@@ -582,25 +660,29 @@ def handle_callback(chat_id, data):
     )
 
 
+# ---------------------------------------------------------------------------
+# Showing helpers
+# ---------------------------------------------------------------------------
+
 def _daylabel(yyyymmdd):
-    """'20260810' -> 'Sun 10/08'."""
+
     from datetime import datetime
 
     try:
+
         return datetime.strptime(
             str(yyyymmdd),
             "%Y%m%d",
-        ).strftime("%a %d/%m")
+        ).strftime(
+            "%a %d/%m"
+        )
 
     except Exception:
+
         return str(yyyymmdd)
 
 
 def show_showtimes(chat_id, chain, slug):
-    """
-    Step 1: after a film is picked, ask WHICH DAY — offering only days
-    that actually have showtimes.
-    """
 
     telegram.send_message(
         chat_id,
@@ -608,9 +690,11 @@ def show_showtimes(chat_id, chain, slug):
     )
 
     try:
+
         days = []
 
         if chain == "vox":
+
             b = vox.fetch_bundle()
 
             movie = vox.find_movie(
@@ -621,10 +705,14 @@ def show_showtimes(chat_id, chain, slug):
             name = (
                 movie["title"]
                 if movie
-                else slug.replace("-", " ").title()
+                else slug.replace(
+                    "-",
+                    " ",
+                ).title()
             )
 
             cinema = "VOX Almaza"
+
             seen = set()
 
             for x in sorted(
@@ -636,18 +724,33 @@ def show_showtimes(chat_id, chain, slug):
                 ),
                 key=lambda z: z["displayDate"],
             ):
-                d = str(x["displayDate"])
+
+                d = str(
+                    x["displayDate"]
+                )
 
                 if d not in seen:
+
                     seen.add(d)
                     days.append(d)
 
         else:
-            name = slug.replace("-", " ").title()
+
+            name = slug.replace(
+                "-",
+                " ",
+            ).title()
+
             cinema = "Scene CFC"
 
-            for ddmm in scene.open_days(slug):
-                dd, mm, yyyy = ddmm.split("-")
+            for ddmm in scene.open_days(
+                slug
+            ):
+
+                dd, mm, yyyy = (
+                    ddmm.split("-")
+                )
+
                 days.append(
                     f"{yyyy}{mm}{dd}"
                 )
@@ -655,11 +758,12 @@ def show_showtimes(chat_id, chain, slug):
             days.sort()
 
         if not days:
+
             return telegram.send_message(
                 chat_id,
                 f"🎬 <b>{name}</b> — {cinema}\n"
-                f"No showtimes yet. Use /upcoming to be pinged "
-                f"when they open.",
+                f"No showtimes yet. "
+                f"Use /upcoming to be pinged when they open.",
             )
 
         rows = [
@@ -687,26 +791,33 @@ def show_showtimes(chat_id, chain, slug):
         )
 
     except Exception as e:
+
         return telegram.send_message(
             chat_id,
             f"Couldn't load days: {e}",
         )
 
 
-def show_day_showtimes(chat_id, chain, slug, yyyymmdd):
-    """
-    Step 2: show one day's showtimes as tap-to-book buttons.
-    """
+def show_day_showtimes(
+    chat_id,
+    chain,
+    slug,
+    yyyymmdd,
+):
 
     telegram.send_message(
         chat_id,
         "Loading showtimes…",
     )
 
-    daylbl = _daylabel(yyyymmdd)
+    daylbl = _daylabel(
+        yyyymmdd
+    )
 
     try:
+
         if chain == "vox":
+
             b = vox.fetch_bundle()
 
             movie = vox.find_movie(
@@ -717,21 +828,28 @@ def show_day_showtimes(chat_id, chain, slug, yyyymmdd):
             name = (
                 movie["title"]
                 if movie
-                else slug.replace("-", " ").title()
+                else slug.replace(
+                    "-",
+                    " ",
+                ).title()
             )
 
             sess = vox.sessions_for(
                 b,
                 movie_slug=slug,
-                display_date=int(yyyymmdd),
+                display_date=int(
+                    yyyymmdd
+                ),
                 time_filter="any",
                 only_available=False,
             )
 
             if not sess:
+
                 return telegram.send_message(
                     chat_id,
-                    f"🎬 <b>{name}</b> — VOX Almaza · {daylbl}\n"
+                    f"🎬 <b>{name}</b> — "
+                    f"VOX Almaza · {daylbl}\n"
                     f"No showtimes for that day.",
                 )
 
@@ -741,6 +859,7 @@ def show_day_showtimes(chat_id, chain, slug, yyyymmdd):
                 sess,
                 key=lambda z: z["showtime"],
             ):
+
                 free = (
                     x["seats"]
                     and x["seats"] > 0
@@ -749,6 +868,7 @@ def show_day_showtimes(chat_id, chain, slug, yyyymmdd):
                 exp = x["experience"]
 
                 if free:
+
                     rows.append([
                         (
                             f"{x['time']} · {exp}",
@@ -757,100 +877,115 @@ def show_day_showtimes(chat_id, chain, slug, yyyymmdd):
                     ])
 
                 else:
+
                     rows.append([
                         (
-                            f"🔴 {x['time']} · {exp} — sold out",
+                            f"🔴 {x['time']} · "
+                            f"{exp} — sold out",
                             "soldout",
                         )
                     ])
 
             return telegram.send_message(
                 chat_id,
-                f"🎬 <b>{name}</b> — VOX Almaza · {daylbl}\n"
+                f"🎬 <b>{name}</b> — "
+                f"VOX Almaza · {daylbl}\n"
                 f"Tap a time to book:",
                 buttons=rows,
             )
 
-        else:
-            name = slug.replace("-", " ").title()
+        # -------------------------------------------------------------------
+        # Scene
+        # -------------------------------------------------------------------
 
-            ddmm = scene.to_ddmmyyyy(
-                int(yyyymmdd)
-            )
+        name = slug.replace(
+            "-",
+            " ",
+        ).title()
 
-            sess = scene.sessions_for(
-                slug,
-                ddmm,
-                time_filter="any",
-            )
+        ddmm = scene.to_ddmmyyyy(
+            int(yyyymmdd)
+        )
 
-            if not sess:
-                return telegram.send_message(
-                    chat_id,
-                    f"🎬 <b>{name}</b> — Scene CFC · {daylbl}\n"
-                    f"No showtimes for that day.",
-                )
+        sess = scene.sessions_for(
+            slug,
+            ddmm,
+            time_filter="any",
+        )
 
-            rows = []
-
-            for x in sess[:10]:
-                raw = (
-                    x["showtime_url"]
-                    .split("?")[0]
-                    .rstrip("/")
-                )
-
-                m = re.search(
-                    r"(?:showtime|booking)-([0-9a-f]{24})",
-                    raw,
-                )
-
-                stid = (
-                    m.group(1)
-                    if m
-                    else None
-                )
-
-                seat_btn = (
-                    f"🗺 {x['time']} · {x['experience']}",
-                    f"seatmap:{stid}"
-                    if stid
-                    else "seatmap:BADID",
-                )
-
-                rows.append([
-                    seat_btn,
-                    (
-                        "Book",
-                        x["showtime_url"],
-                    ),
-                ])
+        if not sess:
 
             return telegram.send_message(
                 chat_id,
-                f"🎬 <b>{name}</b> — Scene CFC · {daylbl}\n"
-                f"🗺 = see seats · Book = go to Scene:",
-                buttons=rows,
+                f"🎬 <b>{name}</b> — "
+                f"Scene CFC · {daylbl}\n"
+                f"No showtimes for that day.",
             )
 
+        rows = []
+
+        for x in sess[:10]:
+
+            raw = (
+                x["showtime_url"]
+                .split("?")[0]
+                .rstrip("/")
+            )
+
+            m = re.search(
+                r"(?:showtime|booking)-([0-9a-f]{24})",
+                raw,
+            )
+
+            stid = (
+                m.group(1)
+                if m
+                else None
+            )
+
+            seat_btn = (
+                f"🗺 {x['time']} · "
+                f"{x['experience']}",
+                f"seatmap:{stid}"
+                if stid
+                else "seatmap:BADID",
+            )
+
+            rows.append([
+                seat_btn,
+                (
+                    "Book",
+                    x["showtime_url"],
+                ),
+            ])
+
+        return telegram.send_message(
+            chat_id,
+            f"🎬 <b>{name}</b> — "
+            f"Scene CFC · {daylbl}\n"
+            f"🗺 = see seats · "
+            f"Book = go to Scene:",
+            buttons=rows,
+        )
+
     except Exception as e:
+
         return telegram.send_message(
             chat_id,
             f"Couldn't load showtimes: {e}",
         )
 
 
+# ---------------------------------------------------------------------------
+# Date helpers
+# ---------------------------------------------------------------------------
+
 def _resolve_date_choice(choice):
-    """
-    Turn a date choice into (dateValue, humanLabel).
 
-    dateValue is:
-      "any"
-      a single YYYYMMDD int
-      a list of YYYYMMDD ints
-    """
-
-    from datetime import datetime, timedelta
+    from datetime import (
+        datetime,
+        timedelta,
+    )
 
     now = (
         datetime.utcnow()
@@ -865,28 +1000,42 @@ def _resolve_date_choice(choice):
     )
 
     def ymd(d):
+
         return int(
             d.strftime("%Y%m%d")
         )
 
     if choice == "any":
-        return "any", "any date"
+
+        return (
+            "any",
+            "any date",
+        )
 
     if choice == "today":
+
         return (
             ymd(now),
-            now.strftime("%a %d/%m"),
+            now.strftime(
+                "%a %d/%m"
+            ),
         )
 
     if choice == "tomorrow":
-        d = now + timedelta(days=1)
+
+        d = now + timedelta(
+            days=1
+        )
 
         return (
             ymd(d),
-            d.strftime("%a %d/%m"),
+            d.strftime(
+                "%a %d/%m"
+            ),
         )
 
     if choice == "friday":
+
         ahead = (
             4 - now.weekday()
         ) % 7
@@ -897,15 +1046,22 @@ def _resolve_date_choice(choice):
 
         return (
             ymd(d),
-            d.strftime("Fri %d/%m"),
+            d.strftime(
+                "Fri %d/%m"
+            ),
         )
 
     if choice == "weekend":
+
         fri = now + timedelta(
-            days=(4 - now.weekday()) % 7
+            days=(
+                4 - now.weekday()
+            ) % 7
         )
 
-        sat = fri + timedelta(days=1)
+        sat = fri + timedelta(
+            days=1
+        )
 
         return (
             [
@@ -916,275 +1072,405 @@ def _resolve_date_choice(choice):
         )
 
     if choice == "week":
+
         return (
             [
                 ymd(
-                    now + timedelta(days=i)
+                    now
+                    + timedelta(days=i)
                 )
                 for i in range(7)
             ],
             "within 7 days",
         )
 
-    return "any", "any date"
+    return (
+        "any",
+        "any date",
+    )
 
 
-def _experience_matches(session, experiences):
-    """
-    Return True if a session matches the selected experience filter.
+# ---------------------------------------------------------------------------
+# Existing matching sessions
+# ---------------------------------------------------------------------------
 
-    Empty experiences means "any experience".
-    """
-    if not experiences:
+def _normalize_experience(value):
+
+    if value is None:
+        return "any"
+
+    s = str(value).strip().lower()
+
+    aliases = {
+        "any": "any",
+
+        "imx": "imax",
+        "imax": "imax",
+
+        "gd": "gold",
+        "gold": "gold",
+
+        "mx": "max",
+        "max": "max",
+
+        "fx": "4dx",
+        "4dx": "4dx",
+
+        "kd": "kids",
+        "kids": "kids",
+
+        "st": "standard",
+        "standard": "standard",
+
+        "screenx": "screenx",
+
+        "vip": "premiere",
+        "premiere": "premiere",
+
+        "stand": "standard",
+    }
+
+    return aliases.get(
+        s,
+        s,
+    )
+
+
+def _experience_matches(
+    actual,
+    wanted,
+):
+
+    wanted = _normalize_experience(
+        wanted
+    )
+
+    if wanted == "any":
         return True
 
-    return session.get("experience") in set(
-        experiences
-    )
-
-
-def _session_key(chain, session):
-    """
-    Stable identifier for a showtime.
-
-    This identifies the showtime itself, not its availability state.
-    """
-    if chain == "vox":
-        return (
-            f"vox:{session.get('id') or session.get('bookingUrl')}"
-        )
-
     return (
-        f"scene:{session.get('showtime_url')}"
+        _normalize_experience(actual)
+        == wanted
     )
-
-
-def _get_all_sessions_for_watch(
-    chain,
-    slug,
-    cinemas,
-    time_filter,
-    date_val,
-):
-    """
-    Get ALL sessions matching cinema/date/time.
-
-    IMPORTANT:
-    This deliberately does NOT filter by experience or availability.
-
-    The watcher needs the complete session set so it can:
-      1. establish a baseline when a date first opens;
-      2. detect a genuinely new showtime later;
-      3. distinguish a new showtime from an availability change.
-    """
-
-    sessions = []
-
-    if chain == "vox":
-        b = vox.fetch_bundle()
-
-        if date_val == "any":
-            return vox.sessions_for(
-                b,
-                movie_slug=slug,
-                cinemas=cinemas,
-                time_filter=time_filter,
-                only_available=False,
-            )
-
-        dates = (
-            date_val
-            if isinstance(date_val, list)
-            else [date_val]
-        )
-
-        for d in dates:
-            sessions.extend(
-                vox.sessions_for(
-                    b,
-                    movie_slug=slug,
-                    cinemas=cinemas,
-                    display_date=d,
-                    time_filter=time_filter,
-                    only_available=False,
-                )
-            )
-
-        return sessions
-
-    # Scene
-    if date_val == "any":
-        dates = sorted(
-            scene.open_days(slug)
-        )
-    else:
-        wanted = (
-            date_val
-            if isinstance(date_val, list)
-            else [date_val]
-        )
-
-        wanted_ddmm = {
-            scene.to_ddmmyyyy(d)
-            for d in wanted
-        }
-
-        dates = [
-            d
-            for d in scene.open_days(slug)
-            if d in wanted_ddmm
-        ]
-
-    for d in dates:
-        sessions.extend(
-            scene.sessions_for(
-                slug,
-                d,
-                time_filter=time_filter,
-            )
-        )
-
-    return sessions
 
 
 def _dates_already_open(
     chain,
     slug,
     cinemas,
-    experiences,
-    time_filter,
+    experience,
     dates,
 ):
-    """
-    Return dates that already have an AVAILABLE session matching
-    the user's actual watcher filters.
 
-    A date having some other experience open does NOT count.
+    """
+    Return the subset of dates that already contain at least one
+    AVAILABLE matching session.
+
+    IMPORTANT:
+
+    We do NOT use Scene.open_days() by itself because that only proves
+    that the day has some experience available.
 
     Example:
-      date has Standard
-      watcher wants IMAX
 
-    -> date is NOT considered satisfying the watcher.
+      IMAX watcher
+      Standard is open
+      IMAX is not open
+
+    Result must be FALSE.
     """
 
     open_now = []
 
     try:
+
         if chain == "vox":
+
             b = vox.fetch_bundle()
 
             for d in dates:
+
                 sessions = vox.sessions_for(
                     b,
                     movie_slug=slug,
                     cinemas=cinemas,
                     display_date=d,
-                    time_filter=time_filter,
+                    time_filter="any",
                     only_available=True,
                 )
 
-                if any(
-                    _experience_matches(
-                        s,
-                        experiences,
-                    )
+                sessions = [
+                    s
                     for s in sessions
-                ):
+                    if _experience_matches(
+                        s.get("experience"),
+                        experience,
+                    )
+                ]
+
+                if sessions:
                     open_now.append(d)
 
         else:
-            for d in dates:
-                ddmm = scene.to_ddmmyyyy(d)
 
-                # If the date itself isn't open, there obviously
-                # cannot be a matching session.
-                if ddmm not in scene.open_days(slug):
+            opendays = scene.open_days(
+                slug
+            )
+
+            for d in dates:
+
+                ddmm = scene.to_ddmmyyyy(
+                    d
+                )
+
+                if ddmm not in opendays:
                     continue
 
                 sessions = scene.sessions_for(
                     slug,
                     ddmm,
-                    time_filter=time_filter,
+                    time_filter="any",
                 )
 
-                if any(
-                    _experience_matches(
-                        s,
-                        experiences,
-                    )
+                sessions = [
+                    s
                     for s in sessions
-                ):
+                    if _experience_matches(
+                        s.get("experience"),
+                        experience,
+                    )
+                ]
+
+                if sessions:
                     open_now.append(d)
 
     except Exception:
+
+        # If the check fails, fall through and create the watch.
         pass
 
     return open_now
 
 
+# ---------------------------------------------------------------------------
+# Session identity
+# ---------------------------------------------------------------------------
+
+def _session_key(
+    chain,
+    session,
+):
+
+    if chain == "vox":
+
+        return (
+            f"vox:"
+            f"{session.get('id') or session.get('bookingUrl')}"
+        )
+
+    return (
+        f"scene:"
+        f"{session.get('showtime_url')}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Initial watcher snapshot
+# ---------------------------------------------------------------------------
+
 def _initial_seen_sessions(
     chain,
     slug,
     cinemas,
-    experiences,
+    experience,
     time_filter,
     date_val,
 ):
+
     """
-    Snapshot ALL sessions that exist at watch creation.
+    Snapshot ALL currently existing matching showtimes.
 
-    We deliberately snapshot all experiences, not just the selected
-    experiences.
+    These are deliberately NOT considered new by cron.
 
-    Example:
-      Date already open with Standard.
-      User watches IMAX.
+    This is what prevents:
 
-    Standard is put in the baseline.
-    Later IMAX appears -> IMAX is genuinely new -> alert.
+        "I created the watcher while IMAX was already open"
 
-    If the date itself opens for the first time:
-      all sessions existing at that moment become baseline
-      -> no alert for the opening itself.
+    from immediately generating an alert.
+
+    It also prevents:
+
+        "Standard was already open when I created an IMAX watcher"
+
+    from interfering with the IMAX watcher.
     """
+
+    seen = []
 
     try:
-        sessions = _get_all_sessions_for_watch(
-            chain,
-            slug,
-            cinemas,
-            time_filter,
-            date_val,
-        )
 
-        return list(
-            dict.fromkeys(
-                _session_key(chain, s)
-                for s in sessions
-            )
-        )
+        if chain == "vox":
+
+            b = vox.fetch_bundle()
+
+            if date_val == "any":
+
+                sessions = vox.sessions_for(
+                    b,
+                    movie_slug=slug,
+                    cinemas=cinemas,
+                    time_filter=time_filter,
+                    only_available=True,
+                )
+
+                sessions = [
+                    s
+                    for s in sessions
+                    if _experience_matches(
+                        s.get("experience"),
+                        experience,
+                    )
+                ]
+
+                seen.extend(
+                    _session_key(
+                        chain,
+                        s,
+                    )
+                    for s in sessions
+                )
+
+            else:
+
+                dates = (
+                    date_val
+                    if isinstance(
+                        date_val,
+                        list,
+                    )
+                    else [date_val]
+                )
+
+                for d in dates:
+
+                    sessions = vox.sessions_for(
+                        b,
+                        movie_slug=slug,
+                        cinemas=cinemas,
+                        display_date=d,
+                        time_filter=time_filter,
+                        only_available=True,
+                    )
+
+                    sessions = [
+                        s
+                        for s in sessions
+                        if _experience_matches(
+                            s.get("experience"),
+                            experience,
+                        )
+                    ]
+
+                    seen.extend(
+                        _session_key(
+                            chain,
+                            s,
+                        )
+                        for s in sessions
+                    )
+
+        else:
+
+            # Scene
+            if date_val == "any":
+
+                dates = scene.open_days(
+                    slug
+                )
+
+            else:
+
+                wanted = (
+                    date_val
+                    if isinstance(
+                        date_val,
+                        list,
+                    )
+                    else [date_val]
+                )
+
+                wanted_ddmm = {
+                    scene.to_ddmmyyyy(d)
+                    for d in wanted
+                }
+
+                dates = [
+                    d
+                    for d in scene.open_days(
+                        slug
+                    )
+                    if d in wanted_ddmm
+                ]
+
+            for d in dates:
+
+                sessions = scene.sessions_for(
+                    slug,
+                    d,
+                    time_filter=time_filter,
+                )
+
+                sessions = [
+                    s
+                    for s in sessions
+                    if _experience_matches(
+                        s.get("experience"),
+                        experience,
+                    )
+                ]
+
+                seen.extend(
+                    _session_key(
+                        chain,
+                        s,
+                    )
+                    for s in sessions
+                )
 
     except Exception:
+
+        # Don't prevent the watch from being created if the initial
+        # snapshot temporarily fails.
         return []
 
+    return list(
+        dict.fromkeys(seen)
+    )
 
-def show_seatmap(chat_id, showtime_id):
-    """
-    Scene only: fetch + render the live seat map (read-only).
-    """
+
+# ---------------------------------------------------------------------------
+# Seat map
+# ---------------------------------------------------------------------------
+
+def show_seatmap(
+    chat_id,
+    showtime_id,
+):
 
     telegram.send_message(
         chat_id,
-        f"Loading seat map… (id={showtime_id})",
+        f"Loading seat map… "
+        f"(id={showtime_id})",
     )
 
     try:
+
         plan = scene_seats.fetch_seat_plan(
             showtime_id
         )
 
     except Exception:
+
         import traceback
 
         return telegram.send_message(
@@ -1193,16 +1479,26 @@ def show_seatmap(chat_id, showtime_id):
             f"{traceback.format_exc()[-600:]}",
         )
 
-    if isinstance(plan, dict) and plan.get("error"):
+    if (
+        isinstance(plan, dict)
+        and plan.get("error")
+    ):
+
         return telegram.send_message(
             chat_id,
-            f"seatmap debug: {plan['error']}",
+            f"seatmap debug: "
+            f"{plan['error']}",
         )
 
-    if not plan or not plan.get("rows"):
+    if (
+        not plan
+        or not plan.get("rows")
+    ):
+
         return telegram.send_message(
             chat_id,
-            f"seatmap debug: empty plan -> {plan!r}",
+            f"seatmap debug: "
+            f"empty plan -> {plan!r}",
         )
 
     caption = (
@@ -1214,32 +1510,47 @@ def show_seatmap(chat_id, showtime_id):
     dbg = ""
 
     try:
+
         png = scene_seats.render_png(
             plan.get("cells") or []
         )
 
-        if isinstance(png, str):
+        if isinstance(
+            png,
+            str,
+        ):
+
             dbg = png
 
         elif not png:
+
             dbg = (
                 "render_png returned None "
                 "(no seats parsed)"
             )
 
         else:
+
             res = telegram.send_photo(
                 chat_id,
                 png,
                 caption=caption,
             )
 
-            if isinstance(res, dict) and res.get("ok"):
+            if (
+                isinstance(res, dict)
+                and res.get("ok")
+            ):
+
                 return
 
-            dbg = f"send_photo failed: {res}"
+            dbg = (
+                f"send_photo failed: "
+                f"{res}"
+            )
 
     except Exception:
+
         import traceback
 
         dbg = (
@@ -1254,17 +1565,31 @@ def show_seatmap(chat_id, showtime_id):
 
     telegram.send_message(
         chat_id,
-        scene_seats.render_text(plan),
+        scene_seats.render_text(
+            plan
+        ),
     )
 
 
-def save_watch(chat_id, date_choice):
-    convo = store.get_convo(chat_id)
+# ---------------------------------------------------------------------------
+# Save watcher
+# ---------------------------------------------------------------------------
+
+def save_watch(
+    chat_id,
+    date_choice,
+):
+
+    convo = store.get_convo(
+        chat_id
+    )
 
     if not convo.get("slug"):
+
         return telegram.send_message(
             chat_id,
-            "Something expired — try /upcoming again.",
+            "Something expired — "
+            "try /upcoming again.",
         )
 
     chain = convo["chain"]
@@ -1276,12 +1601,24 @@ def save_watch(chat_id, date_choice):
 
     cinemas = (
         "any"
-        if cinema_choice.startswith("any")
-        else [cinema_choice.split(":")[1]]
+        if cinema_choice.startswith(
+            "any"
+        )
+        else [
+            cinema_choice.split(":")[1]
+        ]
     )
 
-    experiences = list(
-        convo.get("experiences", [])
+    experience = convo.get(
+        "experience",
+        "any",
+    )
+
+    experience_label = convo.get(
+        "experienceLabel",
+        _experience_label(
+            experience
+        ),
     )
 
     time_filter = convo.get(
@@ -1289,43 +1626,64 @@ def save_watch(chat_id, date_choice):
         "any",
     )
 
-    date_val, date_label = _resolve_date_choice(
-        date_choice
+    date_val, date_label = (
+        _resolve_date_choice(
+            date_choice
+        )
     )
 
     slug = convo["slug"]
 
-    # If a specific date already has a matching AVAILABLE
-    # showtime, don't create a pointless watcher.
+    # -----------------------------------------------------------------------
+    # Specific-date shortcut
+    # -----------------------------------------------------------------------
     #
-    # IMPORTANT:
-    # A date having Standard open does NOT count if the user
-    # selected IMAX.
-    if date_val != "any":
-        dates = (
-            date_val
-            if isinstance(date_val, list)
-            else [date_val]
+    # ONLY skip creating a watcher when the selected date itself already has
+    # a matching experience.
+    #
+    # This fixes:
+    #
+    #   Watch IMAX
+    #   Standard is already open
+    #   -> should STILL create an IMAX watcher
+    #
+    # We also only use this shortcut for a single explicit date.
+    #
+    # For "within 7 days" / "weekend", we KEEP the watcher because some dates
+    # may already be open while other dates may still receive new showtimes.
+
+    if (
+        date_val != "any"
+        and not isinstance(
+            date_val,
+            list,
         )
+    ):
+
+        dates = [date_val]
 
         already = _dates_already_open(
             chain,
             slug,
             cinemas,
-            experiences,
-            time_filter,
+            experience,
             dates,
         )
 
         if already:
-            store.clear_convo(chat_id)
+
+            store.clear_convo(
+                chat_id
+            )
 
             telegram.send_message(
                 chat_id,
-                f"📅 <b>{date_label}</b> already has a "
-                f"matching showtime for "
-                f"<b>{_experience_label(experiences)}</b> — "
-                f"here are the showtimes:",
+                f"📅 <b>{date_label}</b> "
+                f"already has "
+                f"<b>{experience_label}</b> "
+                f"showtimes open for booking — "
+                f"here are the showtimes "
+                f"(no watch needed):",
             )
 
             return show_showtimes(
@@ -1334,48 +1692,49 @@ def save_watch(chat_id, date_choice):
                 slug,
             )
 
-    # Snapshot everything that currently exists.
-    #
-    # This is important for the "date opening" rule:
-    # anything present when the date first becomes visible
-    # is baseline, not a new alert.
-    seen_sessions = _initial_seen_sessions(
-        chain,
-        slug,
-        cinemas,
-        experiences,
-        time_filter,
-        date_val,
+    # -----------------------------------------------------------------------
+    # Snapshot currently existing matching showtimes
+    # -----------------------------------------------------------------------
+
+    seen_sessions = (
+        _initial_seen_sessions(
+            chain,
+            slug,
+            cinemas,
+            experience,
+            time_filter,
+            date_val,
+        )
     )
 
     entry = {
+
         "chain": chain,
+
         "movieSlug": convo["slug"],
-        "movieTitle": convo["slug"].replace(
-            "-",
-            " ",
-        ).title(),
+
+        "movieTitle": (
+            convo["slug"]
+            .replace("-", " ")
+            .title()
+        ),
+
         "cinemas": cinemas,
+
         "mode": "release",
+
         "date": date_val,
+
         "dateLabel": date_label,
+
+        "experience": experience,
+
+        "experienceLabel": experience_label,
+
         "timeFilter": time_filter,
 
-        # Selected theatre/experience types.
-        # [] means any.
-        "experiences": experiences,
-
-        # Existing showtimes are baseline.
+        # Showtimes that existed when this watch was created.
         "seenSessions": seen_sessions,
-
-        # Dates that have already been initialized by the watcher.
-        #
-        # If empty, logic_check will establish each date's baseline
-        # the first time it becomes open.
-        "initializedDates": [],
-
-        # New field used by logic_check for repeated loud alerts.
-        "alertedSessions": [],
     }
 
     store.add_watch(
@@ -1383,7 +1742,9 @@ def save_watch(chat_id, date_choice):
         entry,
     )
 
-    store.clear_convo(chat_id)
+    store.clear_convo(
+        chat_id
+    )
 
     _sync_cron()
 
@@ -1393,24 +1754,30 @@ def save_watch(chat_id, date_choice):
         else f" for <b>{date_label}</b>"
     )
 
-    experience_label = _experience_label(
-        experiences
-    )
-
     telegram.send_message(
         chat_id,
-        f"👀 Watching <b>{entry['movieTitle']}</b>{when}\n"
-        f"🎞 Type: <b>{experience_label}</b>\n"
-        f"I'll alert you when a new matching showtime appears.",
+        f"👀 Watching "
+        f"<b>{entry['movieTitle']}</b>"
+        f"{when}\n"
+        f"🎭 Experience: "
+        f"<b>{experience_label}</b>\n"
+        f"⏰ Time: "
+        f"<b>{time_filter}</b>\n\n"
+        f"I'll ping you loudly only when "
+        f"a <b>new matching showtime</b> "
+        f"opens.",
     )
 
 
-# ---------------- manage ----------------
+# ---------------------------------------------------------------------------
+# Manage
+# ---------------------------------------------------------------------------
 
 DEFAULT_STATUS_SEC = 3600
 
 
 def _fmt_interval(secs):
+
     if secs is None:
         return "1 hour (default)"
 
@@ -1420,17 +1787,23 @@ def _fmt_interval(secs):
         return "off"
 
     if secs % 3600 == 0:
+
         h = secs // 3600
 
         return (
             f"{h} hour"
-            + ("s" if h != 1 else "")
+            + (
+                "s"
+                if h != 1
+                else ""
+            )
         )
 
     return f"{secs // 60} min"
 
 
 def cmd_status(chat_id):
+
     cur = store._get(
         f"status_interval:{chat_id}",
         None,
@@ -1444,18 +1817,34 @@ def cmd_status(chat_id):
         f"How often would you like them?",
         buttons=[
             [
-                ("Every 30 min", "statusiv:1800"),
-                ("Every 1 hour", "statusiv:3600"),
+                (
+                    "Every 30 min",
+                    "statusiv:1800",
+                ),
+                (
+                    "Every 1 hour",
+                    "statusiv:3600",
+                ),
             ],
             [
-                ("Every 3 hours", "statusiv:10800"),
-                ("Off", "statusiv:0"),
+                (
+                    "Every 3 hours",
+                    "statusiv:10800",
+                ),
+                (
+                    "Off",
+                    "statusiv:0",
+                ),
             ],
         ],
     )
 
 
-def set_status_interval(chat_id, secs):
+def set_status_interval(
+    chat_id,
+    secs,
+):
+
     store._set(
         f"status_interval:{chat_id}",
         int(secs),
@@ -1467,12 +1856,16 @@ def set_status_interval(chat_id, secs):
     )
 
     if secs <= 0:
+
         msg = (
-            "🔕 Watcher updates turned <b>off</b>. "
-            "You'll still get loud alerts when a movie opens."
+            "🔕 Watcher updates turned "
+            "<b>off</b>. "
+            "You'll still get loud alerts "
+            "when a movie opens."
         )
 
     else:
+
         msg = (
             f"✅ Watcher updates set to every "
             f"<b>{_fmt_interval(secs)}</b>."
@@ -1485,23 +1878,34 @@ def set_status_interval(chat_id, secs):
 
 
 def cmd_list(chat_id):
-    wl = store.get_watchlist(chat_id)
+
+    wl = store.get_watchlist(
+        chat_id
+    )
 
     if not wl:
+
         return telegram.send_message(
             chat_id,
-            "No active watches. /upcoming to add one.",
+            "No active watches. "
+            "/upcoming to add one.",
         )
 
     lines = [
         "<b>Your watches:</b>"
     ]
 
-    for i, w in enumerate(wl, 1):
+    for i, w in enumerate(
+        wl,
+        1,
+    ):
+
         cine = (
             "any"
             if w["cinemas"] == "any"
-            else ",".join(w["cinemas"])
+            else ",".join(
+                w["cinemas"]
+            )
         )
 
         flag = (
@@ -1515,22 +1919,30 @@ def cmd_list(chat_id):
             "any date",
         )
 
-        experiences = w.get(
-            "experiences",
-            [],
+        experience = w.get(
+            "experienceLabel",
+            _experience_label(
+                w.get(
+                    "experience",
+                    "any",
+                )
+            ),
         )
 
         lines.append(
-            f"{i}. {w['movieTitle']} [{w['chain']}] "
+            f"{i}. "
+            f"{w['movieTitle']} "
+            f"[{w['chain']}] "
             f"@ {cine} "
-            f"· {_experience_label(experiences)} "
+            f"· {experience} "
             f"· {dlabel} "
-            f"· {w.get('timeFilter', 'any')}"
+            f"· {w['timeFilter']}"
             f"{flag}"
         )
 
     lines.append(
-        "\n/booked &lt;n&gt; or /remove &lt;n&gt; to stop one."
+        "\n/booked &lt;n&gt; "
+        "or /remove &lt;n&gt; to stop one."
     )
 
     telegram.send_message(
@@ -1539,16 +1951,23 @@ def cmd_list(chat_id):
     )
 
 
-def cmd_stop(chat_id, text, booked):
+def cmd_stop(
+    chat_id,
+    text,
+    booked,
+):
+
     parts = text.split()
 
     if (
         len(parts) < 2
         or not parts[1].isdigit()
     ):
+
         return telegram.send_message(
             chat_id,
-            "Usage: /%s &lt;number from /list&gt;"
+            "Usage: /%s "
+            "&lt;number from /list&gt;"
             % (
                 "booked"
                 if booked
@@ -1556,17 +1975,28 @@ def cmd_stop(chat_id, text, booked):
             ),
         )
 
-    idx = int(parts[1]) - 1
+    idx = (
+        int(parts[1])
+        - 1
+    )
 
-    wl = store.get_watchlist(chat_id)
+    wl = store.get_watchlist(
+        chat_id
+    )
 
-    if idx < 0 or idx >= len(wl):
+    if (
+        idx < 0
+        or idx >= len(wl)
+    ):
+
         return telegram.send_message(
             chat_id,
             "No watch with that number.",
         )
 
-    title = wl[idx]["movieTitle"]
+    title = wl[idx][
+        "movieTitle"
+    ]
 
     store.remove_watch(
         chat_id,
@@ -1583,17 +2013,21 @@ def cmd_stop(chat_id, text, booked):
 
     telegram.send_message(
         chat_id,
-        f"✅ {verb} <b>{title}</b>.",
+        f"✅ {verb} "
+        f"<b>{title}</b>.",
     )
 
 
 def _sync_cron():
+
     """Enable/disable cron based on whether ANY user has an active watch."""
 
     any_active = False
 
     for cid in store.all_chat_ids():
+
         if store.get_watchlist(cid):
+
             any_active = True
             break
 
@@ -1608,6 +2042,7 @@ def _sync_cron():
     )
 
     if res.get("changed"):
+
         store._set(
             "cron_state",
             res["state"],
