@@ -580,6 +580,7 @@ def run_sweep():
             # Older watches may not have this field. In that case we create
             # the snapshot now rather than alerting on every existing showtime.
             # ---------------------------------------------------------------
+            has_baseline = "seenSessions" in watch
             old_seen = watch.get(
                 "seenSessions"
             )
@@ -588,6 +589,41 @@ def run_sweep():
                 old_seen = []
 
             old_seen = set(old_seen)
+
+            # ---------------------------------------------------------------
+            # Migration safety for watches created by older versions.
+            #
+            # An old watch may have no seenSessions field at all. We MUST NOT
+            # alert on every currently-open matching showtime in that case.
+            # Instead, the first cron run establishes the baseline, exactly
+            # like the current webhook does when the user chooses IGNORE.
+            # Future matching sessions can then be detected normally.
+            # ---------------------------------------------------------------
+            if not has_baseline:
+                current_keys = {
+                    _session_key(
+                        watch["chain"],
+                        session,
+                    )
+                    for session in current_sessions
+                }
+
+                watch["seenSessions"] = list(current_keys)
+
+                current_wl = store.get_watchlist(
+                    chat_id
+                )
+
+                for stored_watch in current_wl:
+                    if stored_watch.get("id") == watch.get("id"):
+                        stored_watch["seenSessions"] = list(current_keys)
+
+                store._set(
+                    f"watchlist:{chat_id}",
+                    current_wl,
+                )
+
+                continue
 
             # ---------------------------------------------------------------
             # Find ONLY newly appearing matching sessions.
