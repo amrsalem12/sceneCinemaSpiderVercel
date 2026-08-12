@@ -151,14 +151,6 @@ def handle_update(update):
         return
 
     if ev["kind"] == "callback":
-        # Telegram may retry a callback while the webhook is still busy
-        # fetching VOX/Scene data. Claim it before doing any work so the same
-        # tap cannot create duplicate watches or hit a conversation that the
-        # first request has already cleared.
-        if not store.claim_callback(ev["callback_id"]):
-            telegram.answer_callback(ev["callback_id"])
-            return
-
         toast = (
             "Sold out"
             if ev["data"] == "soldout"
@@ -382,28 +374,35 @@ def handle_callback(chat_id, data):
     # from /showing.
     # -----------------------------------------------------------------------
     if action == "mark":
+        chain = parts[1]
         store.set_convo(
             chat_id,
             {
-                "chain": parts[1],
+                "chain": chain,
                 "slug": parts[2],
                 "step": "cinema",
             },
         )
 
+        # A VOX movie cannot be watched at Scene and vice versa. Keep the
+        # setup flow chain-safe so a watcher can never be saved against an
+        # impossible cinema.
+        if chain == "vox":
+            cinema_choices = [("VOX Almaza", "vox:000047")]
+        elif chain == "scene":
+            cinema_choices = [("Scene CFC", "scene:cfc")]
+        else:
+            cinema_choices = CINEMA_CHOICES
+
         return telegram.send_message(
             chat_id,
             "Which cinema?",
             buttons=[
-                [
-                    c
-                ]
-                for c in [
-                    (n, f"mc:{v}")
-                    for n, v in CINEMA_CHOICES
-                ]
+                [(name, f"mc:{value}")]
+                for name, value in cinema_choices
             ],
         )
+
 
     # -----------------------------------------------------------------------
     # Cinema selected -> experience
@@ -479,82 +478,36 @@ def handle_callback(chat_id, data):
         )
 
     if action == "mt":
-        convo = store.get_convo(chat_id) or {}
+        convo = store.get_convo(chat_id)
 
-        # Keep the current flow in KV, but also put the complete watcher
-        # setup in the date button itself. This makes the final step resilient
-        # to KV races/expiration between the time button and date button.
         convo["timeFilter"] = parts[1]
         convo["step"] = "date"
-        store.set_convo(chat_id, convo)
 
-        chain = convo.get("chain", "")
-        slug = convo.get("slug", "")
-        cinema_choice = convo.get("cinemaChoice", "any:any")
-        experience = convo.get("experience", "any")
-
-        # Use a compact positional payload. Telegram callback_data is limited
-        # to 64 bytes, so we keep this deliberately short.
-        # md2:<chain>:<slug>:<cinema>:<experience>:<time>:<dateChoice>
-        # cinema is the part after the colon in "vox:000047" / "scene:cfc".
-        cinema_id = cinema_choice.split(":", 1)[1] if ":" in cinema_choice else cinema_choice
-        payload_prefix = (
-            f"md2:{chain}:{slug}:{cinema_id}:{experience}:{parts[1]}"
+        store.set_convo(
+            chat_id,
+            convo,
         )
-
-        buttons = []
-        for n, v in DATE_CHOICES:
-            data = f"{payload_prefix}:{v}"
-            # Keep a defensive fallback if an unusually long slug would exceed
-            # Telegram's callback_data limit. The normal VOX/Scene slugs fit.
-            if len(data.encode("utf-8")) <= 64:
-                buttons.append([(n, data)])
-            else:
-                buttons.append([(n, f"md:{v}")])
 
         return telegram.send_message(
             chat_id,
             "Which date?",
-            buttons=buttons,
+            buttons=[
+                [
+                    (n, f"md:{v}")
+                ]
+                for n, v in DATE_CHOICES
+            ],
         )
-
-    if action == "md2":
-        # Self-contained final callback: do not depend on the transient KV
-        # conversation being present.
-        if len(parts) < 7:
-            return telegram.send_message(
-                chat_id,
-                "This date button is invalid — please start the watcher again.",
-            )
-
-        chain = parts[1]
-        slug = parts[2]
-        cinema_id = parts[3]
-        experience = parts[4]
-        time_filter = parts[5]
-        date_choice = ":".join(parts[6:])
-
-        cinema_choice = f"{chain}:{cinema_id}"
-        if chain == "any":
-            cinema_choice = "any:any"
-
-        store.set_convo(
-            chat_id,
-            {
-                "chain": chain,
-                "slug": slug,
-                "cinemaChoice": cinema_choice,
-                "experience": experience,
-                "timeFilter": time_filter,
-                "step": "date",
-            },
-        )
-
-        return save_watch(chat_id, date_choice)
 
     if action == "md":
-        # Backwards-compatible handler for old date buttons.
-        return save_watch(chat_id, parts[1])
+        return save_watch(
+            chat_id,
+            parts[1],
+        )
+
+    if action == "existing":
+        choice = parts[1] if len(parts) > 1 else ""
+        return resolve_existing_showtimes(chat_id, choice)
 
     return telegram.send_message(
         chat_id,
@@ -1235,7 +1188,238 @@ def show_seatmap(chat_id, showtime_id):
 # Save watcher
 # ---------------------------------------------------------------------------
 
+def _experience_label(experiences):
+    if experiences == "any":
+        return "any experience"
+    if isinstance(experiences, list):
+        return ", ".join(str(x) for x in experiences)
+    return str(experiences)
+
+
+def _existing_session_details(chain, slug, cinemas, time_filter, date_val, experiences):
+    """
+    Return CURRENTLY BOOKABLE sessions matching the ENTIRE watcher setup.
+
+    This function is intentionally strict.  If the cinema/API cannot be
+    checked, it raises instead of returning [] because [] means "we checked
+    and there are no matching showtimes".
+    """
+    sessions = []
+
+    if chain == "vox":
+        b = vox.fetch_bundle()
+        if date_val == "any":
+            sessions = vox.sessions_for(
+                b,
+                movie_slug=slug,
+                cinemas=cinemas,
+                time_filter=time_filter,
+                only_available=True,
+            )
+        else:
+            dates = date_val if isinstance(date_val, list) else [date_val]
+            for d in dates:
+                sessions.extend(
+                    vox.sessions_for(
+                        b,
+                        movie_slug=slug,
+                        cinemas=cinemas,
+                        display_date=int(d),
+                        time_filter=time_filter,
+                        only_available=True,
+                    )
+                )
+
+    elif chain == "scene":
+        if date_val == "any":
+            target_days = sorted(scene.open_days(slug))
+        else:
+            wanted = date_val if isinstance(date_val, list) else [date_val]
+            wanted_ddmm = {scene.to_ddmmyyyy(int(d)) for d in wanted}
+            target_days = [
+                d for d in scene.open_days(slug)
+                if d in wanted_ddmm
+            ]
+
+        for d in target_days:
+            sessions.extend(
+                scene.sessions_for(
+                    slug,
+                    d,
+                    time_filter=time_filter,
+                )
+            )
+    else:
+        raise ValueError(f"Unsupported watcher chain: {chain}")
+
+    return [
+        s for s in sessions
+        if _experience_matches(
+            s.get("experience"),
+            experiences,
+        )
+    ]
+
+
+def _existing_session_label(chain, session):
+    """Human-readable button label for an already-open matching session."""
+    if chain == "vox":
+        date_value = str(session.get("displayDate", ""))
+        if len(date_value) == 8:
+            date_label = f"{date_value[6:8]}/{date_value[4:6]}"
+        else:
+            date_label = date_value
+        parts = [
+            session.get("time", ""),
+            session.get("experience", ""),
+        ]
+        if date_label:
+            parts.append(date_label)
+        return " · ".join(str(x) for x in parts if x)
+
+    return " · ".join(
+        str(x) for x in [
+            session.get("time", ""),
+            session.get("experience", ""),
+        ] if x
+    )
+
+
+def _existing_session_button(chain, session):
+    """Return a normal Telegram button for an already-open session."""
+    label = _existing_session_label(chain, session)
+
+    if chain == "vox":
+        url = session.get("bookingUrl")
+        return (label or "Book", url) if url else None
+
+    url = session.get("showtime_url")
+    return (label or "Book", url) if url else None
+
+
+def _send_existing_matches(chat_id, convo, matches):
+    """
+    Show the user ONLY the currently-open sessions matching their watcher.
+
+    We do not send them back to the generic /showing day picker because that
+    picker intentionally contains all experiences.  Doing that would defeat
+    the selected-experience constraint.
+    """
+    chain = convo["chain"]
+    slug = convo["slug"]
+    date_label = convo.get("dateLabel", "the selected dates")
+    experience_label = _experience_label(convo.get("experience", "any"))
+
+    rows = []
+    for session in matches[:20]:
+        button = _existing_session_button(chain, session)
+        if button:
+            rows.append([button])
+
+    if not rows:
+        return telegram.send_message(
+            chat_id,
+            "The matching showtimes disappeared before I could show them. "
+            "Your watcher was not created. Please try again.",
+        )
+
+    return telegram.send_message(
+        chat_id,
+        f"🎭 <b>{experience_label}</b> already has matching showtimes "
+        f"open for <b>{date_label}</b>.\n\n"
+        "You can book one now, or ignore these and keep watching for a "
+        "future/new matching showtime.",
+        buttons=rows,
+    )
+
+
+def _make_watch_from_convo(chat_id, convo, *, force_seen_matches=None):
+    chain = convo["chain"]
+    cinema_choice = convo.get("cinemaChoice", "any:any")
+    cinemas = "any" if cinema_choice.startswith("any") else [cinema_choice.split(":", 1)[1]]
+    experiences = convo.get("experience", "any")
+    time_filter = convo.get("timeFilter", "any")
+    date_val = convo.get("dateValue", "any")
+    date_label = convo.get("dateLabel", "any date")
+    slug = convo["slug"]
+
+    if force_seen_matches is None:
+        seen_sessions = _initial_seen_sessions(
+            chain, slug, cinemas, time_filter, date_val, experiences=experiences
+        )
+    else:
+        seen_sessions = [_session_key(chain, s) for s in force_seen_matches]
+
+    entry = {
+        "chain": chain,
+        "movieSlug": slug,
+        "movieTitle": convo.get("movieTitle") or slug.replace("-", " ").title(),
+        "cinemas": cinemas,
+        "mode": "release",
+        "date": date_val,
+        "dateLabel": date_label,
+        "timeFilter": time_filter,
+        "experiences": experiences,
+        "seenSessions": list(dict.fromkeys(seen_sessions)),
+    }
+
+    store.add_watch(chat_id, entry)
+    store.clear_convo(chat_id)
+    _sync_cron()
+
+    when = "" if date_val == "any" else f" for <b>{date_label}</b>"
+    return telegram.send_message(
+        chat_id,
+        f"👀 Watching <b>{entry['movieTitle']}</b>{when}.\n"
+        f"🎭 Experience: <b>{_experience_label(experiences)}</b>\n"
+        f"⏰ Time: <b>{time_filter}</b>\n\n"
+        f"I'll ping you loudly only when a <b>new matching</b> showtime opens.",
+    )
+
+
+def resolve_existing_showtimes(chat_id, choice):
+    convo = store.get_convo(chat_id)
+
+    if not convo.get("pendingExisting"):
+        return telegram.send_message(
+            chat_id,
+            "That watcher setup expired. Try /upcoming or /showing again.",
+        )
+
+    matches = convo.get("existingMatches") or []
+
+    if choice == "take":
+        # The matching sessions are already stored in the pending state, so
+        # we can show exactly what matched the watcher.  We must NOT call
+        # show_showtimes(), because that page intentionally includes every
+        # theatre experience.
+        store.clear_convo(chat_id)
+        return _send_existing_matches(chat_id, convo, matches)
+
+    if choice == "ignore":
+        # Snapshot exactly the sessions the user chose to ignore.  They become
+        # the watcher's baseline and therefore cannot trigger an alert.
+        return _make_watch_from_convo(
+            chat_id,
+            convo,
+            force_seen_matches=matches,
+        )
+
+    return telegram.send_message(chat_id, "Unknown watcher choice.")
+
+
 def save_watch(chat_id, date_choice):
+    """
+    Finish watcher setup.
+
+    There are exactly two outcomes:
+
+      A) matching showtimes already exist -> ask TAKE or IGNORE
+      B) no matching showtimes exist -> create the watcher immediately
+
+    The check uses the complete watcher definition: movie, cinema,
+    experience, time filter and date range.
+    """
     convo = store.get_convo(chat_id)
 
     if not convo.get("slug"):
@@ -1245,152 +1429,82 @@ def save_watch(chat_id, date_choice):
         )
 
     chain = convo["chain"]
-
-    cinema_choice = convo.get(
-        "cinemaChoice",
-        "any:any",
-    )
-
+    cinema_choice = convo.get("cinemaChoice", "any:any")
     cinemas = (
         "any"
         if cinema_choice.startswith("any")
-        else [cinema_choice.split(":")[1]]
+        else [cinema_choice.split(":", 1)[1]]
     )
-
-    experiences = convo.get(
-        "experience",
-        "any",
-    )
-
-    time_filter = convo.get(
-        "timeFilter",
-        "any",
-    )
-
-    date_val, date_label = _resolve_date_choice(
-        date_choice
-    )
-
+    experiences = convo.get("experience", "any")
+    time_filter = convo.get("timeFilter", "any")
+    date_val, date_label = _resolve_date_choice(date_choice)
     slug = convo["slug"]
 
-    # ---------------------------------------------------------------
-    # If a specific date already has the SELECTED EXPERIENCE open,
-    # do not create a pointless watcher.
-    #
-    # Crucially:
-    # Gold/Standard opening does NOT count for an IMAX watcher.
-    # ---------------------------------------------------------------
-    if date_val != "any":
-        dates = (
-            date_val
-            if isinstance(date_val, list)
-            else [date_val]
-        )
+    # Persist the completed setup BEFORE making the API request.  If Telegram
+    # retries the callback while the request is slow, the state still describes
+    # the exact watcher the user was configuring.
+    convo.update({
+        "dateValue": date_val,
+        "dateLabel": date_label,
+        "step": "checking_existing",
+        "pendingExisting": False,
+    })
+    store.set_convo(chat_id, convo)
 
-        already = _dates_already_open(
+    try:
+        matches = _existing_session_details(
             chain,
             slug,
             cinemas,
-            dates,
-            experiences=experiences,
-            time_filter=time_filter,
+            time_filter,
+            date_val,
+            experiences,
+        )
+    except Exception as e:
+        # Never interpret an API failure as "no matching showtimes".
+        # That was one of the reasons the old flow appeared inconsistent.
+        convo["step"] = "date"
+        store.set_convo(chat_id, convo)
+        return telegram.send_message(
+            chat_id,
+            "I couldn't check the current showtimes, so I did not create "
+            f"the watcher.\n\nError: {e}\n\nPlease tap the date again.",
         )
 
-        if already:
-            store.clear_convo(chat_id)
+    if matches:
+        convo.update({
+            "step": "existing_choice",
+            "pendingExisting": True,
+            "existingMatches": matches,
+        })
+        store.set_convo(chat_id, convo)
 
-            experience_label = (
-                "any experience"
-                if experiences == "any"
-                else (
-                    ", ".join(experiences)
-                    if isinstance(experiences, list)
-                    else experiences
-                )
+        preview = []
+        for s in matches[:10]:
+            preview.append(
+                f"• {_existing_session_label(chain, s)}"
             )
 
-            telegram.send_message(
-                chat_id,
-                f"📅 <b>{date_label}</b> already has a matching "
-                f"<b>{experience_label}</b> showtime open for booking.\n"
-                f"Here are the available showtimes:",
-            )
-
-            return show_showtimes(
-                chat_id,
-                chain,
-                slug,
-            )
-
-    # ---------------------------------------------------------------
-    # Snapshot matching sessions only.
-    #
-    # This is what prevents an already-open Gold/Standard session from
-    # later being treated as a NEW IMAX session.
-    # ---------------------------------------------------------------
-    seen_sessions = _initial_seen_sessions(
-        chain,
-        slug,
-        cinemas,
-        time_filter,
-        date_val,
-        experiences=experiences,
-    )
-
-    entry = {
-        "chain": chain,
-        "movieSlug": convo["slug"],
-        "movieTitle": convo["slug"].replace("-", " ").title(),
-        "cinemas": cinemas,
-        "mode": "release",
-        "date": date_val,
-        "dateLabel": date_label,
-        "timeFilter": time_filter,
-
-        # NEW:
-        # The experience(s) this watcher is actually interested in.
-        "experiences": experiences,
-
-        # Existing matching sessions at watch creation time.
-        "seenSessions": seen_sessions,
-    }
-
-    store.add_watch(
-        chat_id,
-        entry,
-    )
-
-    store.clear_convo(chat_id)
-
-    _sync_cron()
-
-    when = (
-        ""
-        if date_val == "any"
-        else f" for <b>{date_label}</b>"
-    )
-
-    experience_label = (
-        "any experience"
-        if experiences == "any"
-        else (
-            ", ".join(experiences)
-            if isinstance(experiences, list)
-            else experiences
+        count = len(matches)
+        return telegram.send_message(
+            chat_id,
+            f"🎭 <b>{_experience_label(experiences)}</b> already has "
+            f"<b>{count}</b> matching showtime"
+            f"{'s' if count != 1 else ''} open for <b>{date_label}</b>.\n\n"
+            + "\n".join(preview[:10])
+            + "\n\nDo you want to book one of these now, or ignore them and "
+            "keep watching?",
+            buttons=[
+                [("🎟 Take existing showtimes", "existing:take")],
+                [("👀 Ignore them & keep watching", "existing:ignore")],
+            ],
         )
-    )
 
-    telegram.send_message(
+    return _make_watch_from_convo(
         chat_id,
-        f"👀 Watching <b>{entry['movieTitle']}</b>{when}.\n"
-        f"🎭 Experience: <b>{experience_label}</b>\n"
-        f"⏰ Time: <b>{time_filter}</b>\n\n"
-        f"I'll ping you loudly only when a matching "
-        f"showtime opens.",
+        convo,
     )
 
-
-# ---------------------------------------------------------------------------
 # Manage
 # ---------------------------------------------------------------------------
 
@@ -1470,7 +1584,7 @@ def set_status_interval(chat_id, secs):
     )
 
 
-def _experience_label(w):
+def _watch_experience_label(w):
     experiences = w.get(
         "experiences",
         w.get("experience", "any"),
@@ -1518,7 +1632,7 @@ def cmd_list(chat_id):
 
         lines.append(
             f"{i}. {w['movieTitle']} [{w['chain']}] @ {cine} "
-            f"· 🎭 {_experience_label(w)} "
+            f"· 🎭 {_watch_experience_label(w)} "
             f"· {dlabel} · {w['timeFilter']}{flag}"
         )
 
