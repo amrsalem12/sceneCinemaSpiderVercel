@@ -580,50 +580,16 @@ def run_sweep():
             # Older watches may not have this field. In that case we create
             # the snapshot now rather than alerting on every existing showtime.
             # ---------------------------------------------------------------
-            has_baseline = "seenSessions" in watch
             old_seen = watch.get(
                 "seenSessions"
             )
 
-            if old_seen is None:
-                old_seen = []
-
-            old_seen = set(old_seen)
-
-            # ---------------------------------------------------------------
-            # Migration safety for watches created by older versions.
-            #
-            # An old watch may have no seenSessions field at all. We MUST NOT
-            # alert on every currently-open matching showtime in that case.
-            # Instead, the first cron run establishes the baseline, exactly
-            # like the current webhook does when the user chooses IGNORE.
-            # Future matching sessions can then be detected normally.
-            # ---------------------------------------------------------------
-            if not has_baseline:
-                current_keys = {
-                    _session_key(
-                        watch["chain"],
-                        session,
-                    )
-                    for session in current_sessions
-                }
-
-                watch["seenSessions"] = list(current_keys)
-
-                current_wl = store.get_watchlist(
-                    chat_id
-                )
-
-                for stored_watch in current_wl:
-                    if stored_watch.get("id") == watch.get("id"):
-                        stored_watch["seenSessions"] = list(current_keys)
-
-                store._set(
-                    f"watchlist:{chat_id}",
-                    current_wl,
-                )
-
-                continue
+            # Legacy watches created before seenSessions existed must be
+            # bootstrapped from the CURRENT matching sessions. Otherwise the
+            # first cron run would incorrectly alert for every showtime that
+            # was already open before the watcher existed.
+            legacy_snapshot = old_seen is None
+            old_seen = set(old_seen or [])
 
             # ---------------------------------------------------------------
             # Find ONLY newly appearing matching sessions.
@@ -651,7 +617,7 @@ def run_sweep():
 
                 current_keys.add(key)
 
-                if key not in old_seen:
+                if not legacy_snapshot and key not in old_seen:
                     new_sessions.append(
                         session
                     )
