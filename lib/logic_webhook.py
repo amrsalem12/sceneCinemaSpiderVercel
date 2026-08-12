@@ -30,6 +30,7 @@ import os
 import re
 import sys
 import json
+from datetime import datetime
 
 
 from lib import store, telegram, vox, scene, scene_seats, cronjob  # noqa: E402
@@ -1242,13 +1243,20 @@ def _existing_session_details(chain, slug, cinemas, time_filter, date_val, exper
             ]
 
         for d in target_days:
-            sessions.extend(
-                scene.sessions_for(
-                    slug,
-                    d,
-                    time_filter=time_filter,
-                )
+            day_sessions = scene.sessions_for(
+                slug,
+                d,
+                time_filter=time_filter,
             )
+
+            # Scene's session objects do not carry their date because the
+            # date is supplied to sessions_for(). Preserve it here so an
+            # existing-showtime preview can tell the user exactly which
+            # day each matching showtime belongs to.
+            for session in day_sessions:
+                session["displayDate"] = d
+
+            sessions.extend(day_sessions)
     else:
         raise ValueError(f"Unsupported watcher chain: {chain}")
 
@@ -1262,27 +1270,38 @@ def _existing_session_details(chain, slug, cinemas, time_filter, date_val, exper
 
 
 def _existing_session_label(chain, session):
-    """Human-readable button label for an already-open matching session."""
+    """
+    Human-readable label for an already-open matching session.
+
+    The DATE is deliberately included because a watcher may cover multiple
+    days (for example, "within 7 days"). The order is date -> time ->
+    experience so the user can immediately distinguish otherwise identical
+    showtimes.
+    """
+    date_value = str(session.get("displayDate", ""))
+
     if chain == "vox":
-        date_value = str(session.get("displayDate", ""))
-        if len(date_value) == 8:
-            date_label = f"{date_value[6:8]}/{date_value[4:6]}"
+        # VOX: YYYYMMDD
+        if len(date_value) == 8 and date_value.isdigit():
+            try:
+                date_label = datetime.strptime(date_value, "%Y%m%d").strftime("%a %d/%m")
+            except ValueError:
+                date_label = f"{date_value[6:8]}/{date_value[4:6]}"
         else:
             date_label = date_value
-        parts = [
-            session.get("time", ""),
-            session.get("experience", ""),
-        ]
-        if date_label:
-            parts.append(date_label)
-        return " · ".join(str(x) for x in parts if x)
+    else:
+        # Scene: DD-MM-YYYY (the date passed to sessions_for).
+        try:
+            date_label = datetime.strptime(date_value, "%d-%m-%Y").strftime("%a %d/%m")
+        except ValueError:
+            date_label = date_value
 
-    return " · ".join(
-        str(x) for x in [
-            session.get("time", ""),
-            session.get("experience", ""),
-        ] if x
-    )
+    parts = [
+        date_label,
+        session.get("time", ""),
+        session.get("experience", ""),
+    ]
+    return " · ".join(str(x) for x in parts if x)
 
 
 def _existing_session_button(chain, session):
